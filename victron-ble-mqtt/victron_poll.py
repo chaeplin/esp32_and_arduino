@@ -235,7 +235,7 @@ def save_pv(obj: dict) -> None:
 
 
 def pub_cmd(c: mqtt.Client, cmd: str) -> None:
-    payload = json.dumps({"cmd": cmd})
+    payload = json.dumps({"cmd": cmd}, separators=(",", ":"))
     c.publish(CMD, payload, qos=0)
     log(f"TX {CMD} {payload}")
 
