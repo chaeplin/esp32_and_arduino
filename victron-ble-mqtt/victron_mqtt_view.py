@@ -817,6 +817,14 @@ body.only-days .matwrap { margin:0; border-radius:0; min-height:100dvh; }
 <script>
 if (new URLSearchParams(location.search).get('only')==='days') document.body.classList.add('only-days');
 const STATES = ['off','low_power','fault','bulk','absorption','float'];
+const STATE_ALIAS = {
+  abs:'absorption', absorption:'absorption',
+  flt:'float', float:'float',
+  eq:'equalize', equalise:'equalize', equalize:'equalize',
+  start:'starting', starting:'starting',
+  sto:'storage', storage:'storage',
+  lp:'low_power', lowpower:'low_power', low_power:'low_power'
+};
 let DAYS = [];
 let HIST = {wifi:[], mppt:[], sense:[], board:[]};
 let LIVE = {ymd:'', yield_kwh:null, consumed_kwh:null, consumed_src:null, pmax_w:null, vpv_max:null, vbat_max:null, vbat_min:null, load_wh:0, load_t:0};
@@ -824,7 +832,8 @@ let LIVE = {ymd:'', yield_kwh:null, consumed_kwh:null, consumed_src:null, pmax_w
 function renderStates(cur){
   const el = document.getElementById('states');
   if (!el) return;
-  const now = (cur||'').toLowerCase();
+  const raw = (cur||'').toLowerCase();
+  const now = STATE_ALIAS[raw] || raw;
   el.innerHTML = STATES.map(s =>
     '<span class="'+(s===now?'on':'')+'">'+s+'</span>'
   ).join('');
