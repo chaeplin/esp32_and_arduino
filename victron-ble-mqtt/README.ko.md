@@ -112,12 +112,48 @@ Instant Readout AES 키는 이 저장소가 만들지 않습니다. VictronConne
 
 MPPT와 Sense는 키를 따로 복사합니다. GitHub에는 `0x00` × 16만 둡니다.
 
+## MQTT 토픽
+
+| 토픽 | 방향 | 내용 |
+|---|---|---|
+| `victron/mppt` | pub | ADV 10초 평균 (vbat, ibat, power, yield_wh, load_a, state) |
+| `victron/sense` | pub | ADV 10초 평균 (vbat, temp) |
+| `victron/status` | pub | 보드 상태 (mode, rssi, clock, nvs, wifi, uptime) |
+| `victron/mppt/hist` | pub | 일일 이력 (today / yesterday) |
+| `victron/mppt/pv` | pub | GATT PV (vpv, ppv, ipv). 없는 값은 null |
+| `victron/gatt/cmd` | sub | `{"cmd":"hist"}` / `{"cmd":"pv"}` / `{"cmd":"unpair"}` |
+| `victron/lwt` | pub | online / offline (retain) |
+| `yard/time` | sub | `{"epoch":..., "kst":"..."}` NTP 보조 |
+
 ## 동작
 
-1. **ADV** — CID `0x02E1`, record `0x10` 을 AES-128-CTR로 풀어 10초 평균 발행.
-2. **hist** — **어제(day1, `0x1051`)만**. NVS에 어제가 있으면 GATT 생략.
-3. **pv** — `0xEDBB` / `0xEDBC` / `0xEDBD` 읽고 해제.
+1. **ADV** — manufacturer data CID `0x02E1`, record `0x10` 을 AES-128-CTR로 풀어 10초 평균 발행.
+2. **hist** — **어제(day1, `0x1051`)만**. NTP 또는 `yard/time`으로 KST 날짜가 있어야 함. NVS에 어제가 있으면 GATT 생략. 없으면 어제 페이지를 읽고 NVS에 저장한 뒤 끊음. 오늘 칸은 ADV 실시간(수율·Pmax·Vbat)과 소비 추정.
+3. **pv** — `0xEDBB` / `0xEDBC` / `0xEDBD` 읽고 `victron/mppt/pv` 발행 후 해제.
 4. **unpair** — 본드와 NVS 이력 삭제.
+
+## 펌웨어
+
+1. VictronConnect에서 Instant Readout 키·MAC을 복사해 스케치 상단(또는 로컬 `config.h`)에 넣는다.
+2. Arduino IDE에서 `Adafruit ESP32 Feather` 선택 후 업로드.
+3. Feather는 `pool.ntp.org` / `time.google.com` 과 `yard/time` 을 함께 씁니다.
+
+## 호스트
+
+```bash
+python3 -m pip install paho-mqtt
+cp .env.example .env
+python3 yard_time_pub.py
+python3 victron_poll.py
+python3 victron_mqtt_view.py
+# 대시보드 http://127.0.0.1:8772
+```
+
+`victron_poll.py`: 00:15 이후 **어제** hist가 없으면 10분마다 `hist` 재시도. MPPT state가 `off`가 아니면 10분마다 `pv`. 오늘 소비는 ADV `load_a × vbat` 적분, 오늘 수율이 생기면 어제 소비/수율 비로 바꿈.
+
+systemd user 유닛은 `victron-poll.service` 참고. `WorkingDirectory` / `ExecStart` 경로만 맞추면 됩니다.
+
+InfluxDB는 선택입니다. 토큰은 `INFLUX_TOKEN` 또는 gitignore된 `./influx.token`.
 
 ## 라이선스
 
