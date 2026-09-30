@@ -1,0 +1,33 @@
+# secrets / local config
+config.h
+.env
+influx.token
+influx.env
+**/influx.token
+**/influx.env
+firmware/config.h
+host/.env
+
+# runtime
+victron_store/
+**/victron_store/
+*.log
+victron_poll.log
+victron_board_24h.jsonl
+victron_pv.json
+victron_pv.jsonl
+__pycache__/
+*.pyc
+
+# not for public repo
+AGENTS.md
+browsed_files/
+스크린샷*
+IMG_*.PNG
+IMG_*.png
+
+# editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
