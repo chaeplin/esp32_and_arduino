@@ -1,45 +1,47 @@
 # victron-ble-mqtt
 
-Local bridge: an Adafruit HUZZAH32 (ESP32) decrypts Victron Instant Readout BLE advertisements, publishes MQTT JSON, and opens a short GATT session only when it needs yesterday’s history or PV registers.
+ESP32(Adafruit HUZZAH32)로 Victron Instant Readout(BLE ADV)을 복호화해 MQTT로 올리고, 필요할 때만 GATT로 일일 이력·PV 레지스터를 읽는 로컬 브리지입니다.
 
-Most of the time it only listens to advertisements and publishes a 10-second average. A `hist` or `pv` command connects to the MPPT, reads, then disconnects.
+평소에는 광고 패킷만 듣고 10초 평균을 발행합니다. `hist` / `pv` 명령이 오면 MPPT에 짧게 연결해 값을 읽고 바로 끊습니다.
 
-> Example values are anonymized. Fill in Wi-Fi, MQTT, PIN, MAC, and Instant Readout keys locally. Do not commit them.
+> 예제 값은 모두 익명화되어 있습니다. Wi-Fi, MQTT, PIN, MAC, Instant Readout 키는 로컬에서만 채우세요.
 
-## Built with
+영문 README가 기본입니다. 이 파일은 한국어 설명입니다.
 
-VictronConnect Instant Readout advertisements and GATT hist/pv packets were captured and matched against HUZZAH32 serial logs, handshake by handshake, together with [SuperGrok](https://grok.com). Advertisement layout follows Victron’s published Extra Manufacturer Data. This is not an official Victron SDK or sample.
+## 제작
 
-## Screenshots
+VictronConnect의 BLE Instant Readout 광고와 GATT hist/pv 패킷을 캡처하고, HUZZAH32 시리얼 로그로 핸드셰이크·레지스터를 맞춰 가며 [슈퍼그록(SuperGrok)](https://grok.com)과 합작으로 만들었습니다. Instant Readout 광고 형식은 Victron이 공개한 Extra Manufacturer Data를 참고했습니다. 공식 SDK나 샘플 코드가 아닙니다.
 
-Local dashboard vs VictronConnect. Serials on the app shots are redacted.
+## 화면
 
-Live numbers can disagree because the shots were not taken at the same instant. **Compare closed days only — yesterday and the day before.** GATT `hist` in this project reads **yesterday (day1) only**. Older days come from the app history or values already stored.
+로컬 대시보드와 VictronConnect 비교입니다. 앱 쪽 시리얼은 가렸습니다.
 
-### Local dashboard
+라이브 값은 찍은 시각이 달라 숫자가 어긋날 수 있습니다. **맞는지 볼 것은 어제·그제처럼 이미 닫힌 날** 입니다. 이 프로젝트 GATT `hist` 는 **어제(day1)만** 읽습니다. 그제 이전은 앱 기록·이미 저장해 둔 값입니다.
+
+### 로컬 대시보드
 
 ![dashboard](dashboard.png)
 
 `victron_mqtt_view.py` — http://127.0.0.1:8772
 
-### VictronConnect status
+### VictronConnect 상태
 
 ![app-status](app-status.png)
 
-Live PV voltage, battery voltage, and temperature are for context only (time offset).
+라이브(태양광 V, 배터리 V, 온도)는 시간차 참고용입니다.
 
-### VictronConnect history
+### VictronConnect 기록
 
 ![app-history](app-history.png)
 
-| Day | Yield | Max P | Max Vpv | Battery max/min | Used |
+| 날 | 수율 | 최대 P | 최대 Vpv | 배터리 max/min | 소비 |
 |---|---|---|---|---|---|
-| Yesterday | 120 Wh | 23 W | 36.30 V | 13.43 / 12.64 V | 100 Wh |
-| Day before | 130 Wh | 23 W | 37.20 V | 13.48 / 12.62 V | 110 Wh |
+| 어제 | 120 Wh | 23 W | 36.30 V | 13.43 / 12.64 V | 100 Wh |
+| 그제 | 130 Wh | 23 W | 37.20 V | 13.48 / 12.62 V | 110 Wh |
 
-Yesterday matches GATT `hist` day1. The day before is a closed day already on the dashboard.
+어제 값은 GATT `hist` day1과 같습니다. 그제는 앱 기록과 대시보드에 남아 있는 닫힌 날입니다.
 
-## Layout
+## 구성
 
 ```
 SmartSolar MPPT 75/15  ──BLE ADV (AES-128-CTR)──┐
@@ -49,151 +51,76 @@ Smart Battery Sense    ──BLE ADV (AES-128-CTR)──┤
                                        ADV 10s + GATT burst
                                                 │ MQTT
                                                 ▼
-                             broker ──┬── victron_poll.py      yesterday hist + 10 min PV
-                                      ├── victron_mqtt_view.py local dashboard :8772
+                             broker ──┬── victron_poll.py      어제 hist + 10분 PV
+                                      ├── victron_mqtt_view.py 로컬 대시보드 :8772
                                       ├── yard_time_pub.py     KST epoch → yard/time
-                                      └── (optional) InfluxDB
+                                      └── (선택) InfluxDB
 ```
 
-## Hardware / libraries
+## 하드웨어 / 라이브러리
 
 - Adafruit HUZZAH32 (ESP32 Feather)
-- Arduino IDE board: `Adafruit ESP32 Feather`
+- Arduino IDE 보드: `Adafruit ESP32 Feather`
 - NimBLE-Arduino 2.x
 - PubSubClient
-- Example devices: SmartSolar MPPT 75/15, Smart Battery Sense
+- 대상 기기 예: SmartSolar MPPT 75/15, Smart Battery Sense
 
-## Files
+## 파일
 
 ```
-victron_gatt_bridge_feather.ino   ESP32 firmware (ADV + GATT)
-config.example.h                  secret template (local copy only)
+victron_gatt_bridge_feather.ino   ESP32 펌웨어 (ADV + GATT)
+config.example.h                  비밀값 템플릿 (복사해서 로컬에만 사용)
 LICENSE                           MIT
-README.ko.md                      한국어 리드미
-victron_poll.py                   yesterday hist + 10 min PV + today use estimate
-victron_mqtt_view.py              local dashboard http://127.0.0.1:8772
-yard_time_pub.py                  Feather clock helper (yard/time)
-victron-poll.service              systemd user unit
-victron_days.json                 sample daily history
-.env.example                      host MQTT/Influx template
-dashboard.png                     local dashboard
-app-status.png                    VictronConnect status (compare)
-app-history.png                   VictronConnect history (compare)
+README.md                         English (default)
+README.ko.md                      한국어
+victron_poll.py                   어제 hist + 10분 PV + 오늘 소비 추정
+victron_mqtt_view.py              로컬 대시보드 http://127.0.0.1:8772
+yard_time_pub.py                  Feather 시각 보조 (yard/time)
+victron-poll.service              systemd user 유닛
+victron_days.json                 일일 이력 예제
+.env.example                      호스트 MQTT/Influx 템플릿
+dashboard.png                     로컬 대시보드 화면
+app-status.png                    VictronConnect 상태 (비교)
+app-history.png                   VictronConnect 기록 (비교)
 .gitignore
 ```
 
-## Do not commit
+## 올리지 말 것
 
-Keep these out of GitHub:
-
-- Wi-Fi SSID / password
-- MQTT host, user, password
+- Wi-Fi SSID / 비밀번호
+- MQTT 호스트·계정·비밀번호
 - Victron BLE PIN
-- Device serial / MAC
-- Instant Readout AES-128 key (16 bytes)
-- InfluxDB token (`influx.token`, `influx.env`)
-- Real home-directory paths
+- 기기 시리얼 / MAC
+- Instant Readout AES-128 키 (16바이트)
+- InfluxDB 토큰 (`influx.token`, `influx.env`)
+- 홈 디렉터리 실경로
 
-`.gitignore` already covers `config.h`, `.env`, `influx.token`, `*.log`, and `victron_store/`.
+`.gitignore` 에 `config.h`, `.env`, `influx.token`, `*.log`, `victron_store/` 가 들어 있습니다.
 
-Example PIN is `000000`. Example AES key is sixteen `0x00` bytes.
+PIN 예제는 `000000`, AES 키 예제는 `0x00` 16바이트입니다.
 
-The Instant Readout AES key is not generated here. Copy it per device from VictronConnect into `g_dev[].key`.
+Instant Readout AES 키는 이 저장소가 만들지 않습니다. VictronConnect 앱에서 기기별로 복사해 `g_dev[].key` 에 넣습니다.
 
-Anyone with the key and PIN can read that charger or sensor.
+## Instant Readout AES 키
 
-## Config examples
+1. VictronConnect에서 해당 기기에 연결(PIN)
+2. 설정(톱니) → 메뉴 → **Product Info**
+3. **Instant Readout via Bluetooth** 켜기
+4. **Instant Readout Details** 옆 **Show**
+5. **Advertisement key**(hex 32자 = 16바이트)와 MAC을 복사
+6. 스케치 `g_dev[].macHex` / `g_dev[].key` 에 붙여 넣기 (로컬만)
 
-Firmware (`victron_gatt_bridge_feather.ino` header or `config.example.h`):
+MPPT와 Sense는 키를 따로 복사합니다. GitHub에는 `0x00` × 16만 둡니다.
 
-```
-WIFI_SSID=YOUR_WIFI_SSID
-WIFI_PASS=YOUR_WIFI_PASSWORD
-MQTT_HOST=YOUR_MQTT_HOST
-MQTT_PORT=1883
-MQTT_USER=YOUR_MQTT_USER
-MQTT_PASS=YOUR_MQTT_PASSWORD
-MQTT_CLIENT=victron-gatt-bridge
-VICTRON_PIN=000000
-```
+## 동작
 
-Devices (MAC is 12 hex chars, no colons):
+1. **ADV** — CID `0x02E1`, record `0x10` 을 AES-128-CTR로 풀어 10초 평균 발행.
+2. **hist** — **어제(day1, `0x1051`)만**. NVS에 어제가 있으면 GATT 생략.
+3. **pv** — `0xEDBB` / `0xEDBC` / `0xEDBD` 읽고 해제.
+4. **unpair** — 본드와 NVS 이력 삭제.
 
-```
-mppt  SN=YOUR_MPPT_SN   MAC=aabbccddeeff  KEY=00…00
-sense SN=YOUR_SENSE_SN  MAC=112233445566  KEY=00…00
-```
-
-### Instant Readout AES key
-
-The firmware AES-128 key is not created by this project. **Copy it per device from the VictronConnect app** into `g_dev[].key`. It is not shared across a model.
-
-1. Connect to the device in VictronConnect (PIN)
-2. Settings (gear) → menu → **Product Info**
-3. Enable **Instant Readout via Bluetooth**
-4. **Show** next to **Instant Readout Details**
-5. Copy the **Advertisement key** (32 hex chars = 16 bytes) and the MAC
-6. Paste into `g_dev[].macHex` / `g_dev[].key` (local only)
-
-Copy MPPT and Sense keys separately. The repo keeps `0x00` × 16 only. A Bluetooth PIN reset can change the key — copy it again from the app.
-
-Host environment or `.env`:
-
-```
-MQTT_HOST=YOUR_MQTT_HOST
-MQTT_USER=YOUR_MQTT_USER
-MQTT_PASSWORD=YOUR_MQTT_PASSWORD
-INFLUX_URL=http://127.0.0.1:8086
-INFLUX_ORG=your-org
-INFLUX_BUCKET=victron
-INFLUX_TOKEN=YOUR_INFLUX_TOKEN
-```
-
-## MQTT topics
-
-| Topic | Dir | Payload |
-|---|---|---|
-| `victron/mppt` | pub | ADV 10 s average (vbat, ibat, power, yield_wh, load_a, state) |
-| `victron/sense` | pub | ADV 10 s average (vbat, temp) |
-| `victron/status` | pub | board (mode, rssi, clock, nvs, wifi, uptime) |
-| `victron/mppt/hist` | pub | daily history (today / yesterday) |
-| `victron/mppt/pv` | pub | GATT PV (vpv, ppv, ipv). Missing fields are null |
-| `victron/gatt/cmd` | sub | `{"cmd":"hist"}` / `{"cmd":"pv"}` / `{"cmd":"unpair"}` |
-| `victron/lwt` | pub | online / offline (retain) |
-| `yard/time` | sub | `{"epoch":..., "kst":"..."}` NTP helper |
-
-## Behavior
-
-1. **ADV** — manufacturer data CID `0x02E1`, record `0x10`, AES-128-CTR, publish a 10 s average.
-2. **hist** — **yesterday only** (day1, `0x1051`). Needs a KST date from NTP or `yard/time`. Skip GATT if yesterday is already in NVS. Otherwise read yesterday, store it, disconnect. Today’s row is live ADV (yield, Pmax, Vbat) plus an estimated use.
-3. **pv** — read `0xEDBB` / `0xEDBC` / `0xEDBD`, publish `victron/mppt/pv`, disconnect.
-4. **unpair** — drop the bond and NVS history.
-
-## Firmware
-
-1. Copy Instant Readout key and MAC from VictronConnect into the sketch header (or a local `config.h`).
-2. In Arduino IDE pick `Adafruit ESP32 Feather` and upload.
-3. The Feather uses `pool.ntp.org` / `time.google.com` and `yard/time`.
-
-## Host
-
-```bash
-python3 -m pip install paho-mqtt
-cp .env.example .env
-python3 yard_time_pub.py
-python3 victron_poll.py
-python3 victron_mqtt_view.py
-# dashboard http://127.0.0.1:8772
-```
-
-`victron_poll.py`: after 00:15, if yesterday’s hist is missing, retry `hist` every 10 minutes. If MPPT state is not `off`, request `pv` every 10 minutes. Today’s use is integrated from ADV `load_a × vbat`; once today’s yield is non-zero it switches to yesterday’s use/yield ratio.
-
-See `victron-poll.service` for a systemd user unit. Adjust `WorkingDirectory` / `ExecStart`.
-
-InfluxDB is optional. Token from `INFLUX_TOKEN` or a gitignored `./influx.token`.
-
-## License
+## 라이선스
 
 [MIT](LICENSE).
 
-Not an official Victron SDK. Victron and VictronConnect are trademarks of Victron Energy.
+공식 Victron SDK가 아닙니다. Victron / VictronConnect 상표는 Victron Energy 소유입니다.
