@@ -1,0 +1,13 @@
+{
+  "20260929": {
+    "ymd": 20260929,
+    "kind": "yesterday",
+    "yield_kwh": 0.13,
+    "consumed_kwh": 0.11,
+    "pmax_w": 23,
+    "vpv_max": 37.2,
+    "vbat_max": 13.48,
+    "vbat_min": 12.62,
+    "src": "gatt"
+  }
+}
