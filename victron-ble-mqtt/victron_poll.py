@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Daily hist (yesterday) + 10-min PV when MPPT is not off.
+"""Daily hist + 10-min PV when MPPT is not off.
+
+    First hist: {"cmd":"hist","days":7}
+    After days.json already has closed days: only yesterday {"cmd":"hist","days":1}
 
     python3 victron_poll.py
     systemd: victron_poll.service
@@ -16,12 +19,6 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import paho.mqtt.client as mqtt
-
-CMD = "victron/gatt/cmd"
-T_MPPT = "victron/mppt"
-T_HIST = "victron/mppt/hist"
-T_PV = "victron/mppt/pv"
-T_STATUS = "victron/status"
 
 HERE = Path(__file__).resolve().parent
 
@@ -45,6 +42,12 @@ MQTT_HOST = os.environ.get("MQTT_HOST", "YOUR_MQTT_HOST")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("MQTT_USER", "YOUR_MQTT_USER")
 MQTT_PASS = os.environ.get("MQTT_PASSWORD", os.environ.get("MQTT_PASS", "YOUR_MQTT_PASSWORD"))
+CMD = "victron/gatt/cmd"
+T_MPPT = "victron/mppt"
+T_HIST = "victron/mppt/hist"
+T_PV = "victron/mppt/pv"
+T_STATUS = "victron/status"
+
 STORE = HERE / "victron_store"
 DAYS_FILE = STORE / "days.json"
 DAYS_VIEW = HERE / "victron_days.json"
@@ -57,6 +60,8 @@ mppt_state = "off"
 last_hist_try = 0.0
 last_pv_s = 0.0
 last_load_s = 0.0
+last_load_t = 0.0
+load_ymd = 0
 
 
 def now_kst() -> datetime:
@@ -116,12 +121,19 @@ def save_day(obj: dict) -> None:
     rec = {
         "ymd": int(ymd),
         "kind": obj.get("kind") or "",
+        "day": obj.get("day"),
+        "seq": obj.get("seq"),
         "yield_kwh": obj.get("yield_kwh"),
         "consumed_kwh": obj.get("consumed_kwh"),
         "pmax_w": obj.get("pmax_w"),
         "vpv_max": obj.get("vpv_max"),
         "vbat_max": obj.get("vbat_max"),
         "vbat_min": obj.get("vbat_min"),
+        "ibat_max": obj.get("ibat_max"),
+        "bulk_min": obj.get("bulk_min"),
+        "abs_min": obj.get("abs_min"),
+        "float_min": obj.get("float_min"),
+        "err": obj.get("err"),
         "src": obj.get("src") or "gatt",
         "ts": now_kst().isoformat(timespec="seconds"),
     }
@@ -189,6 +201,9 @@ def upsert_today_adv(obj: dict) -> None:
             rec["vbat_max"] = max(float(old["vbat_max"]), float(rec["vbat_max"]))
         if old.get("vbat_min") is not None and rec.get("vbat_min") is not None:
             rec["vbat_min"] = min(float(old["vbat_min"]), float(rec["vbat_min"]))
+        for keep in ("seq", "day", "ibat_max", "bulk_min", "abs_min", "float_min", "err"):
+            if rec.get(keep) is None and old.get(keep) is not None:
+                rec[keep] = old[keep]
         if old.get("src") == "gatt" and old.get("consumed_kwh") is not None:
             rec["consumed_kwh"] = old["consumed_kwh"]
             rec["consumed_src"] = "gatt"
@@ -234,10 +249,24 @@ def save_pv(obj: dict) -> None:
     log(f"SAVE pv vpv={row['vpv']} ppv={row['ppv']}")
 
 
-def pub_cmd(c: mqtt.Client, cmd: str) -> None:
-    payload = json.dumps({"cmd": cmd}, separators=(",", ":"))
+def pub_cmd(c: mqtt.Client, cmd: str, **extra) -> None:
+    payload = json.dumps({"cmd": cmd, **extra}, separators=(",", ":"))
     c.publish(CMD, payload, qos=0)
     log(f"TX {CMD} {payload}")
+
+
+def closed_day_count(days: dict) -> int:
+    today = today_ymd()
+    n = 0
+    for k, v in days.items():
+        try:
+            if int(k) == today:
+                continue
+            if v.get("yield_kwh") is not None:
+                n += 1
+        except Exception:
+            pass
+    return n
 
 
 def on_connect(c, _u, _f, rc, _p=None) -> None:
@@ -283,10 +312,19 @@ def loop(c: mqtt.Client) -> None:
         t = now_kst()
         ymd_y = yesterday_ymd()
         days = load_days()
-        have_y = str(ymd_y) in days
+        yrec = days.get(str(ymd_y)) or {}
+        have_y = (
+            yrec.get("src") in ("gatt", "nvs")
+            and (yrec.get("bulk_min") is not None or yrec.get("kind") in ("yesterday", "day"))
+        )
         if not have_y and after_hist_gate(t) and time.time() - last_hist_try >= 600:
-            log(f"MISS yday {ymd_y} — hist retry")
-            pub_cmd(c, "hist")
+            n = closed_day_count(days)
+            if n >= 6:
+                log(f"MISS yday {ymd_y} — hist days=1 (have {n} closed)")
+                pub_cmd(c, "hist", days=1)
+            else:
+                log(f"MISS yday {ymd_y} — first hist days=7 (have {n} closed)")
+                pub_cmd(c, "hist", days=7)
             last_hist_try = time.time()
         with lock:
             st = mppt_state

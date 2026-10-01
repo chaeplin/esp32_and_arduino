@@ -6,15 +6,17 @@ Most of the time it just listens to advertisements and publishes a 10-second ave
 
 > Sample values are anonymized. Fill in Wi-Fi, MQTT, PIN, MAC, and Instant Readout keys only on your machine.
 
+Korean: [README.ko.md](README.ko.md)
+
 ## Credits
 
-Built with [SuperGrok](https://grok.com) by capturing VictronConnect BLE Instant Readout advertisements and GATT hist/pv packets, then matching handshake and registers against HUZZAH32 serial logs. Instant Readout layout follows Victron's published Extra Manufacturer Data. Not an official SDK or sample.
+Built with [SuperGrok](https://grok.com) / Grokbot: VictronConnect BLE Instant Readout advertisements and GATT hist/pv packets were captured and matched against HUZZAH32 serial logs. Daily history was then extended to **30 days** (multi-session GATT + NVS cache). Instant Readout layout follows Victron's published Extra Manufacturer Data. Not an official SDK or sample.
 
 ## Screenshots
 
 Local dashboard vs VictronConnect. App serial numbers are redacted.
 
-Live values were taken at different times, so they will not line up. **Compare closed days only (yesterday and the day before).** This project reads GATT `hist` for **yesterday (day1)** only. Older days are whatever was already stored.
+Live values were taken at different times, so they will not line up. **Compare closed days**, not the live status tab. GATT `hist` can read **today + up to 30 closed days** (`0x1050` … `0x106E`). The screenshots below only check yesterday and the day before.
 
 ### Local dashboard
 
@@ -37,7 +39,7 @@ Live PV voltage, battery voltage, and temperature are reference only (time offse
 | Yesterday | 120 Wh | 23 W | 36.30 V | 13.43 / 12.64 V | 100 Wh |
 | Day before | 130 Wh | 23 W | 37.20 V | 13.48 / 12.62 V | 110 Wh |
 
-Yesterday matches GATT `hist` day1. The day before is a closed day already on the dashboard and in the app history.
+Yesterday is GATT `hist` day1. The day before is day2. The dashboard can show a 30-day table after a `{"cmd":"hist","days":30}` pull.
 
 ## Layout
 
@@ -49,7 +51,7 @@ Smart Battery Sense    ──BLE ADV (AES-128-CTR)──┤
                                        ADV 10s + GATT burst
                                                 │ MQTT
                                                 ▼
-                             broker ──┬── victron_poll.py      yesterday hist + 10-min PV
+                             broker ──┬── victron_poll.py      hist (7-day first fill, then yesterday) + 10-min PV
                                       ├── victron_mqtt_view.py local dashboard :8772
                                       ├── yard_time_pub.py     KST epoch → yard/time
                                       └── (optional) InfluxDB
@@ -71,7 +73,7 @@ config.example.h                  secrets template (local only)
 LICENSE                           MIT
 README.md                         English (default)
 README.ko.md                      Korean
-victron_poll.py                   yesterday hist + 10-min PV + today consumption estimate
+victron_poll.py                   hist days=7 first, then days=1 + 10-min PV + today use estimate
 victron_mqtt_view.py              local dashboard http://127.0.0.1:8772
 yard_time_pub.py                  Feather clock helper (yard/time)
 victron-poll.service              systemd user unit
@@ -157,17 +159,17 @@ INFLUX_TOKEN=YOUR_INFLUX_TOKEN
 | `victron/mppt` | pub | ADV 10 s average (vbat, ibat, power, yield_wh, load_a, state) |
 | `victron/sense` | pub | ADV 10 s average (vbat, temp) |
 | `victron/status` | pub | board status (mode, rssi, clock, nvs, wifi, uptime) |
-| `victron/mppt/hist` | pub | daily history (today / yesterday) |
+| `victron/mppt/hist` | pub | one message per day (today / yesterday / day N) |
 | `victron/mppt/pv` | pub | GATT PV (vpv, ppv, ipv). missing fields are null |
-| `victron/gatt/cmd` | sub | `{"cmd":"hist"}` / `{"cmd":"pv"}` / `{"cmd":"unpair"}` |
+| `victron/gatt/cmd` | sub | `{"cmd":"hist"}` / `{"cmd":"hist","days":N}` / `{"cmd":"pv"}` / `{"cmd":"unpair"}` |
 | `victron/lwt` | pub | online / offline (retain) |
 | `yard/time` | sub | `{"epoch":..., "kst":"..."}` NTP helper |
 
 ## Behavior
 
 1. **ADV** — decrypt manufacturer data CID `0x02E1`, record `0x10` with AES-128-CTR and publish a 10 s average.
-2. **hist** — **yesterday only (day1, `0x1051`)**. Needs a KST date from NTP or `yard/time`. Skip GATT if NVS already has yesterday. Otherwise read the yesterday page, store it in NVS, and disconnect. Today's row is live ADV (yield, Pmax, Vbat) plus a consumption estimate.
-3. **pv** — read `0xEDBB` / `0xEDBC` / `0xEDBD`, publish `victron/mppt/pv`, disconnect.
+2. **hist** — `{"cmd":"hist"}` or `{"cmd":"hist","days":N}` with N ≤ 30. day0 = today `0x1050`, day1 = yesterday `0x1051`, … dayN = `0x1050+N` (max `0x106E`). Needs a KST date from NTP or `yard/time`. Closed days live in an NVS ring cache. A session reads about 16 days then reconnects and resumes. After the first fill, poll only asks for yesterday (`days`: 1) plus today.
+3. **pv** — GET `0xEDBB` (PV V). `0xEDBC` (W) arrives as an unsolicited notify. `0xEDBD` is not requested on this SmartSolar. Then publish `victron/mppt/pv` and disconnect.
 4. **unpair** — drop the bond and NVS history.
 
 ## Firmware
@@ -187,7 +189,7 @@ python3 victron_mqtt_view.py
 # dashboard http://127.0.0.1:8772
 ```
 
-`victron_poll.py`: after 00:15, if yesterday hist is missing, retry `hist` every 10 minutes. If MPPT state is not `off`, request `pv` every 10 minutes. Today's consumption is the ADV `load_a × vbat` integral; once today's yield appears it switches to yesterday's consumed/yield ratio.
+`victron_poll.py`: after 00:15, if yesterday is missing, retry every 10 minutes. First fill uses `{"cmd":"hist","days":7}`; once several closed days are stored it only asks `{"cmd":"hist","days":1}` for yesterday. If MPPT state is not `off`, request `pv` every 10 minutes. Today's use is the ADV `load_a × vbat` integral; once today's yield appears it switches to yesterday's consumed/yield ratio.
 
 See `victron-poll.service` for a systemd user unit. Adjust `WorkingDirectory` / `ExecStart`.
 
