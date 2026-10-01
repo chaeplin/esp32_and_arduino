@@ -35,14 +35,21 @@ cp .env.example .env && python3 victron_mqtt_view.py     # http://127.0.0.1:8772
 
 | 언제 | 하는 일 |
 |---|---|
-| 매 분 (RTC 시계 기준 정각) | BLE 스캔 → 기기당 ADV 10개(최대 9 s) 평균 → `victron/mppt`, `victron/sense`, `victron/status` 발행 → deep sleep |
+| 매 분 (RTC 시계 기준 정각) | BLE 스캔(100 % duty, interval = window = 100 ms) → 기기당 ADV 5개(최대 6 s) 평균 → `victron/mppt`, `victron/sense`, `victron/status` 발행 → deep sleep. 깨어 있는 시간 보통 4~5 s |
 | 매 10분 (분 % 10 == 0) | GATT 로 history **day0** → `victron/mppt/hist`, MPPT 가 충전 중이면 PV → `victron/mppt/pv`. 실패하면 다음 몇 번의 기상에서 재시도 |
 | day0 seq 증가 감지 시 | 같은 작업에서 **day1** 을 읽어 `kind:"yesterday"` 로 발행 (이전 날의 최종값). 시간이 모자라면 다음 기상에서 |
 | 00:10 이후 | 어제(day1)가 아직 발행되지 않았을 때만 읽는 **fallback** (seq 롤오버로 이미 발행됐으면 아무것도 안 함) |
 | MQTT 명령 | `victron/gatt/cmd` (QoS1, persistent session 이라 자는 동안 들어온 명령도 다음 기상에 처리) |
 
-시계: 첫 부팅 NTP, 이후 1시간마다 재동기 (`yard/time` 에 epoch 를 보내도 됨). 시간대 KST.
+다음 기상 시각은 매번 잠들기 직전의 시계로 "다음 분 정각"을 다시 계산하므로, 오래 깨어 있던 기상(10분 작업, 15~20 s)이 다음 주기에 영향을 주지 않습니다.
 닫힌 날(day1..N)은 NVS 링 캐시(40일)에 저장해서 다시 읽지 않습니다.
+
+### 시계
+
+- **NTP 10분마다**: UDP 패킷 1개로 묻는 간이 NTP (보통 50~150 ms, 실패하면 SNTP 로 대체). 첫 부팅도 NTP.
+- **드리프트 보정**: HUZZAH32 에는 32 kHz 크리스털이 없어 deep sleep 중에는 내부 RC(150 kHz)로 시간을 셉니다. 실측 약 **+1.5 %** 빠름 (분당 ~0.9 s). NTP 때마다 잠든 시간 대비 오차로 ppm 을 추정해 RTC 메모리와 NVS(`drift`)에 저장하고, 매 기상마다 `직전 수면 시간 × ppm` 만큼 시계를 되돌립니다. 보정이 잡히면 `ts` 오차 ±1 s 이내.
+- **`yard/time` 은 대체 수단만**: 시계가 없거나 NTP 가 6시간 넘게 실패했을 때만 사용. 평소에는 무시(`yard_ign` 카운트)하고, persistent session 에 남은 구독도 한 번 해제합니다. (예전에는 긴 10분 작업 기상 중에 retained `yard/time` 이 시계를 덮어써서 `ts_offset` 이 10분 톱니 모양이 됐습니다.)
+- 시간대 KST.
 
 ### 날짜 라벨 (seq 기반)
 
@@ -61,23 +68,41 @@ Victron 은 history 의 하루를 **자정이 아니라 저녁에 PV 가 꺼진 
 |---|---|
 | `victron/mppt` | `id, src, sn, model, mac, rssi, vbat, ibat, power, yield_wh, load_a, state, state_n, error, n, ts` (ADV 평균, n = 평균한 패킷 수) |
 | `victron/sense` | `id, src, sn, model, mac, rssi, vbat, temp, n, ts` |
-| `victron/status` | 보드 상태: `fw, boot, wake, awake_ms, wdt, adv_*_n, *_rssi, clock, ntp_age, ntp_adj_ms, today, yday, day0_done, yday_done, wifi_*, vbat`(보드 배터리)`, heap, rst` … |
+| `victron/status` | 보드 상태: `fw, boot, wake, awake_ms, prev_awake_ms, wdt, adv_*_n, *_rssi, hits, dec_ok, dec_fail, dec_dup, dec_other, clock, clk, ntp_ms, drift_ppm, yard_ign, ntp_age, ntp_adj_ms, today, yday, day0_done, yday_done, wifi_*, vbat`(보드 배터리)`, heap, heap_min, rst` … (아래 표) |
 | `victron/mppt/hist` | `id, sn, src`(gatt\|nvs)`, kind`(today\|yesterday\|day)`, day, ymd, seq, label, yield_kwh, consumed_kwh, pmax_w, vpv_max, vbat_max, vbat_min, ibat_max, bulk_min, abs_min, float_min, err[4]` |
 | `victron/mppt/pv` | `id, sn, src, vpv, ppv, ipv` (`ipv_calc:true` = ppv/vpv 로 계산) |
 | `victron/lwt` | retained `{"tok","state":"sleep","ts","time","next","boot","awake_ms","wdt"}` — 다음 기상 시각 포함 (MQTT will 없음) |
 | `victron/gatt/cmd` (구독) | `{"cmd":"hist"}`, `{"cmd":"hist","days":N}` (N ≤ 30), `{"cmd":"pv"}`, `{"cmd":"unpair"}` |
 | `yard/time` (구독) | epoch 숫자 또는 `{"epoch":…}` — NTP 가 안 될 때의 시계 |
 
+### 상태 필드 (일부)
+
+| 필드 | 뜻 |
+|---|---|
+| `dec_ok` | 새로 복호화된 Instant Readout 패킷 수 (이번 기상) |
+| `dec_dup` | 같은 nonce 의 반복 패킷 (같은 값, 평균에서 제외) |
+| `dec_other` | Instant Readout(0x10)이 아닌 Victron 레코드 — 무해 |
+| `dec_fail` | 진짜 실패 (키/길이/값 이상). 정상이면 0 |
+| `clk` | 시계 출처 `ntp`(UDP) / `sntp` / `yard` / `none` |
+| `ntp_ms` | 이번 기상의 NTP 소요 ms (0 = 이번엔 안 함) |
+| `drift_ppm` | 추정한 deep sleep 드리프트 (+ = 빠름). 보통 ~15000 |
+| `yard_ign` | 무시한 `yard/time` 메시지 누계 |
+| `ntp_adj_ms` | 마지막 NTP 때 시계를 옮긴 양 (보정 후 잔차) |
+
+전형값 (보드 실측): `awake_ms` 4~5 s (10분 작업 기상은 15~20 s), `adv_*_n` 5, `dec_fail` 0, `wdt` 0, `wifi_ms` ~250 ms, heap ~104 KB, `drift_ppm` ~15000 (deep sleep 중 ~1.5 % 빠름).
+
 ## 뷰어
 
 - `/` — 실시간 값, 오늘/어제 요약, 31일 history 표(충전단계 막대, 수율, Pmax, Vpv, 배터리 최대/최소, Ibat, 소비, 오류), InfluxDB 가 있으면 차트
-- `/status` — `victron/status` 그래프 (보드 전압, Wi-Fi/BLE RSSI, 깨어 있던 시간 등, 최근 24 h)
+- 보드 패널 (WiFi / MPPT BLE / Sense BLE / 보드 V): 수신한 `victron/status` 의 최근 1h ↔ 24h(클릭) 현재·최소·최대. RSSI 0 과 0 V 는 "값 없음" 으로 제외
+- `/status` — `victron/status` 그래프 (RSSI 0 / 0 V 점 제외, 보드 전압, Wi-Fi/BLE RSSI, 깨어 있던 시간 등, 최근 24 h)
 - API: `/state` (전체 상태 + `days` + `dev_ymd`), `/days`, `/hist?range=12h|24h|48h|1w|1m|all` (Influx), `/api/status_hist?range=1h|6h|24h`
 - 상태 파일: `victron_days.json`, `victron_status_hist.json`, `victron_pv.json`, `victron_board_24h.jsonl` (모두 git 제외)
 - InfluxDB 측정값 이름은 `victron_mppt`, `victron_sense` 를 가정 (MQTT → Influx 적재는 별도, 예: Telegraf)
 
 ## 메모
 
+- **배터리**: ADV 를 100 % duty·5개/6 s 로 바꿔 매 분 깨어 있는 시간이 ~9.7 s → 4~5 s 로 줄었습니다 (깨어 있는 동안의 에너지 약 절반).
 - **저녁 롤오버**: 위 "날짜 라벨" 참고. 첫 부팅 휴리스틱은 맑은 날 저녁엔 맞지만, 하루 종일 발전이 0 이었던 날 18시 이후 첫 부팅이면 하루 앞당겨 붙을 수 있습니다 (다음 롤오버부터는 seq 로 정상화).
 - **ibat**: `ibat_max` 는 history 레코드 byte 28 을 0.1 A 단위 배터리 최대 전류로 해석한 것으로, VictronConnect 와 대조 검증하지 않았습니다. ADV 의 `ibat` 도 부호/의미를 충분히 검증하지 않았습니다.
 - **HUZZAH32 수면 전류**: ESP32 칩 자체는 deep sleep 에서 수십 µA 이지만, 이 보드는 USB-UART(CP2104)·LDO·충전 회로 때문에 보드 전체로는 수 mA 수준이 흐릅니다. 배터리 운용이면 직접 측정하세요.

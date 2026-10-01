@@ -458,6 +458,8 @@ def _push_board(obj: dict[str, Any]) -> None:
         mp = None
     if se is not None and se >= 0:
         se = None
+    if vb is not None and vb <= 0.5:          # statuspage3: 0.00 = no ADC reading
+        vb = None
     _board_q.append([now, wifi, mp, se, vb])
     cut = now - BOARD_KEEP
     while _board_q and _board_q[0][0] < cut:
@@ -474,6 +476,45 @@ STATUS_RANGES: dict[str, float] = {"1h": 3600, "6h": 6 * 3600, "24h": 24 * 3600}
 _status_q: deque[dict] = deque()
 _status_lock = threading.Lock()
 _status_saved = 0.0
+
+
+def _sig_ok(field: str, v: Any) -> bool:
+    """statuspage3: RSSI 0 / >= 0 / <= -127 = no reading; board vbat <= 0.5 V = no reading"""
+    if v is None or isinstance(v, bool):
+        return False
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return False
+    if x != x:
+        return False
+    if field.endswith("rssi"):
+        return -127.0 < x < 0.0
+    if field in ("vbat", "board_v"):
+        return x > 0.5
+    return True
+
+
+MM_FIELDS = (("wifi", "wifi_rssi"), ("mppt", "mppt_rssi"), ("sense", "sense_rssi"), ("board", "vbat"))
+MM_NOW_MAX_AGE = 150.0     # "현재" only from a status received within this many seconds
+
+
+def _board_mm(span: float) -> dict[str, Any]:
+    """main-page panel: current/min/max per field over the last `span` s of received
+    victron/status messages (same source as /status), 0/null excluded"""
+    now = time.time()
+    with _status_lock:
+        pts = [p for p in _status_q if p["rx"] >= now - span]
+    last_rx = pts[-1]["rx"] if pts else None
+    out: dict[str, Any] = {"span": span, "n": len(pts), "last_rx": last_rx}
+    for key, field in MM_FIELDS:
+        vals = [float(p["d"][field]) for p in pts if _sig_ok(field, p["d"].get(field))]
+        cur = None
+        if pts and now - pts[-1]["rx"] <= MM_NOW_MAX_AGE and _sig_ok(field, pts[-1]["d"].get(field)):
+            cur = float(pts[-1]["d"][field])
+        out[key] = {"now": cur, "min": min(vals) if vals else None,
+                    "max": max(vals) if vals else None, "n": len(vals)}
+    return out
 
 
 def _status_nums(obj: dict[str, Any]) -> dict[str, float]:
@@ -547,7 +588,11 @@ def _status_hist(key: str) -> dict[str, Any]:
             if k not in seen:
                 seen.add(k)
                 fields.append(k)
-    cols = {k: [p["d"].get(k) for p in pts] for k in fields}
+    def _cell(k: str, v: Any) -> Any:
+        if (k.endswith("rssi") or k == "vbat") and not _sig_ok(k, v):
+            return None                     # statuspage3: 0 = no reading → no point
+        return v
+    cols = {k: [_cell(k, p["d"].get(k)) for p in pts] for k in fields}
     return {"range": key, "t0": t0, "t1": now, "n": len(pts),
             "rx": [round(p["rx"], 3) for p in pts], "f": cols}
 
@@ -861,6 +906,9 @@ from(bucket: "{INFLUX_BUCKET}")
         out["board_v"] = _series(brows, "vbat")
     except Exception:
         pass
+    for k in ("wifi_rssi", "mppt_rssi", "sense_rssi", "board_v"):
+        if out.get(k):                        # statuspage3: 0 rssi / 0 V = no reading
+            out[k] = [p for p in out[k] if _sig_ok(k, p[1])]
     with state_lock:
         pts = list(state.get("board_pts") or [])
     cut = now - span
@@ -1158,7 +1206,7 @@ body.only-days .matwrap { margin:0; border-radius:0; min-height:100dvh; }
         <div class="row"><span class="k">부하 ADV</span><span class="v" id="load_row">—</span></div>
       </div>
       <div class="card">
-        <div class="row" style="border:0;padding-bottom:4px"><span class="k">보드</span><span></span></div>
+        <div class="row" style="border:0;padding-bottom:4px"><span class="k">보드</span><span class="k" id="mmwin" style="cursor:pointer" title="최소/최대 기간 = 수신한 victron/status (클릭: 1h ↔ 24h). RSSI 0 / 0 V 는 제외">최근 1h</span></div>
         <table class="mm">
           <tr><th></th><th>현재</th><th>최소</th><th>최대</th></tr>
           <tr><td>WiFi</td><td id="w_now">—</td><td id="w_min">—</td><td id="w_max">—</td></tr>
@@ -1224,6 +1272,30 @@ function mm(arr){
   for (const x of vs){ if (x<a) a=x; if (x>b) b=x; }
   return [a,b];
 }
+/* statuspage3: panel values come from the server (received victron/status history, same as /status) */
+let MMWIN = localStorage.getItem('mm_win') || '1h';
+function setMM(id, o, dp){
+  o = o || {};
+  document.getElementById(id+'_now').textContent = f(o.now, dp, '');
+  document.getElementById(id+'_min').textContent = f(o.min, dp, '');
+  document.getElementById(id+'_max').textContent = f(o.max, dp, '');
+}
+function showMM(s){
+  const el = document.getElementById('mmwin');
+  if (el) el.textContent = '최근 ' + MMWIN;
+  const bm = (s && s.board_mm) ? s.board_mm[MMWIN] : null;
+  if (!bm) return;
+  setMM('w', bm.wifi, 0); setMM('m', bm.mppt, 0); setMM('s', bm.sense, 0); setMM('bv', bm.board, 2);
+}
+let LAST_STATE = null;
+(function(){
+  const el = document.getElementById('mmwin');
+  if (el) el.addEventListener('click', () => {
+    MMWIN = (MMWIN === '1h') ? '24h' : '1h';
+    localStorage.setItem('mm_win', MMWIN);
+    showMM(LAST_STATE);
+  });
+})();
 function set3(id, cur, arr, dp){
   document.getElementById(id+'_now').textContent = f(cur, dp, '');
   const r = mm(arr);
@@ -1461,16 +1533,8 @@ async function tick(){
     document.getElementById('v_yd').textContent = f(fromH.vpv_max, 2, ' V');
     document.getElementById('gatt_pv').textContent =
       (pv.vpv!=null || pv.ppv!=null) ? (f(pv.vpv,2,' V')+' / '+f(pv.ppv,2,' W')) : '—';
-    const wr = stt.wifi_rssi, mrss = stt.mppt_rssi != null ? stt.mppt_rssi : m.rssi;
-    const srss = stt.sense_rssi != null ? stt.sense_rssi : b.rssi;
-    if (rssiOk(wr)) push(HIST.wifi, wr);
-    if (rssiOk(mrss)) push(HIST.mppt, mrss);
-    if (rssiOk(srss)) push(HIST.sense, srss);
-    if (stt.vbat!=null) push(HIST.board, stt.vbat);
-    set3('w', rssiOk(wr)?wr:null, HIST.wifi, 0);
-    set3('m', rssiOk(mrss)?mrss:null, HIST.mppt, 0);
-    set3('s', rssiOk(srss)?srss:null, HIST.sense, 0);
-    set3('bv', stt.vbat, HIST.board, 2);
+    LAST_STATE = s;
+    showMM(s);
     if (s.days) {
       DAYS = Object.keys(s.days).map(k => Object.assign({ymd:k}, s.days[k]));
     }
@@ -1718,6 +1782,7 @@ class H(BaseHTTPRequestHandler):
             days = _days_view(snap.get("days") or {})
             snap["days"] = days
             snap["dev_ymd"] = _dev_today(days)
+            snap["board_mm"] = {"1h": _board_mm(3600), "24h": _board_mm(24 * 3600)}
             body = json.dumps(snap).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

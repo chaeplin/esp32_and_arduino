@@ -1,5 +1,5 @@
 /*
- * Adafruit HUZZAH32 ESP32 Feather — Victron ADV + GATT → MQTT, DEEP-SLEEP version (sleep2)
+ * Adafruit HUZZAH32 ESP32 Feather — Victron ADV + GATT → MQTT, DEEP-SLEEP version (sleep3)
  *
  * Every minute (wake aligned to the minute boundary from the RTC clock):
  *   BLE scan until ADV_TARGET decoded ADV packets per device (or ADV_SCAN_TIMEOUT_MS)
@@ -28,10 +28,27 @@
  *     device already rolled this evening → tomorrow's date.
  *   - ymd(day k) = ymd(day0) - k. hist JSON has "label":"seq"|"clock" (how the day0 base was found).
  *
+ * sleep3 — clock + ADV:
+ *   - The ts_offset sawtooth (+~1 s/min, reset on the 10-min job wakes) = deep-sleep RTC drift
+ *     (internal 150 kHz RC, ~1.7 % fast) that was silently reset by retained yard/time messages,
+ *     received during the long MQTT-connected job wakes (persistent session keeps an old
+ *     subscription). The hourly NTP step then only showed the drift since that reset (~0.75 s).
+ *     Now: yard/time is unsubscribed + ignored while NTP is fresh (< YARD_MAX_NTP_AGE_S);
+ *     a one-packet UDP NTP query (~50-150 ms) resyncs every NTP_RESYNC_S (600 s, SNTP fallback);
+ *     each NTP step updates a drift estimate (ppm of deep-sleep time, RTC + NVS "drift") and
+ *     every deep-sleep wake subtracts lastSleep * ppm from the clock.
+ *   - Wake alignment was already absolute (next minute boundary from the clock at sleep time,
+ *     no carry-over from a long wake); unchanged.
+ *   - ADV: 100 % scan duty (window = interval), ADV_TARGET 5, timeout 6 s (was 50 %, 10, 9 s).
+ *   - status: dec_ok = new decoded packets, dec_dup = repeats (same nonce), dec_other = Victron
+ *     non-readout records (not 0x10, harmless), dec_fail = real failures (key/length/invalid);
+ *     + drift_ppm, clk ("ntp"|"yard"|"sntp"), ntp_ms, yard_ign.
+ *
  * Arduino: Adafruit ESP32 Feather (esp32 core 3.3.x), NimBLE-Arduino 2.x, PubSubClient
  */
 
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <PubSubClient.h>
 #include <NimBLEDevice.h>
 #include <Preferences.h>
@@ -92,9 +109,11 @@ static const IPAddress STATIC_DNS(SECRET_STATIC_DNS);
 
 /* schedule / budgets */
 #define WAKE_PERIOD_S         60      /* wake on every minute boundary */
-#define ADV_TARGET            10      /* decoded ADV packets per device to average */
-#define ADV_SCAN_TIMEOUT_MS   9000    /* publish whatever arrived by then */
-#define ADV_SENSE_GRACE_MS    3000    /* after MPPT has ADV_TARGET, wait at most this long for the sense */
+#define ADV_TARGET            5       /* sleep3: decoded ADV packets per device to average (was 10) */
+#define ADV_SCAN_TIMEOUT_MS   6000    /* sleep3: publish whatever arrived by then (was 9000) */
+#define ADV_SENSE_GRACE_MS    2000    /* after MPPT has ADV_TARGET, wait at most this long for the sense */
+#define SCAN_INTERVAL         160     /* 0.625 ms units: 100 ms */
+#define SCAN_WINDOW           160     /* sleep3: = interval → 100 % duty (was 80 = 50 %) */
 #define HIST_EVERY_MIN        10      /* day0 hist (+pv) when minute % this == 0 */
 #define YDAY_HOUR             0       /* day1 (yesterday) from 00:10 on */
 #define YDAY_MIN              10
@@ -105,7 +124,11 @@ static const IPAddress STATIC_DNS(SECRET_STATIC_DNS);
 #define AWAKE_MAX_MIN_MS      50000UL /* watchdog: forced deep sleep on a plain minute wake */
 #define AWAKE_MAX_JOB_MS      110000UL/* ... and on a wake with GATT jobs */
 #define JOB_RESERVE_MS        8000UL  /* stop starting GATT work this long before the watchdog */
-#define NTP_RESYNC_S          3600    /* RTC (internal 150 kHz RC) drifts — resync hourly */
+#define NTP_RESYNC_S          600     /* sleep3: quick UDP NTP every 10 min (was SNTP hourly) */
+#define NTP_QUICK_TIMEOUT_MS  800     /* one UDP NTP request/reply */
+#define YARD_MAX_NTP_AGE_S    21600   /* yard/time only if no NTP for 6 h (or no clock at all) */
+#define DRIFT_MIN_SLEEP_S     240     /* min deep-sleep time between two NTP steps to estimate drift */
+#define DRIFT_MAX_PPM         50000   /* clamp (5 %) */
 #define NTP_FIRST_TIMEOUT_MS  10000
 #define NTP_RESYNC_TIMEOUT_MS 3000
 #define WIFI_FAST_TIMEOUT_MS  3000    /* cached BSSID/channel attempt, then normal connect */
@@ -271,6 +294,8 @@ Preferences prefs;
 
 static uint32_t g_bootMs, g_lastScanRst;
 static uint32_t g_scanHits, g_decOk, g_decFail, g_gattStartMs, g_histNextMs;
+static uint32_t g_decDup, g_decOther;    /* sleep3: repeats (same nonce) / non-readout Victron records */
+static uint32_t g_ntpMs = 0;            /* sleep3: duration of this wake's NTP sync, 0 = none */
 static uint8_t g_connFails;
 static int g_mode = MODE_ADV, g_job = JOB_NONE;
 static volatile bool g_wantHist, g_wantPv, g_wantUnpair, g_enc, g_sawNotify, g_histPubPending;
@@ -335,7 +360,7 @@ static bool g_havePvV, g_havePvW, g_havePvA;
 static float g_pvV, g_pvWatt, g_pvA;
 
 /* ---- sleep1: state kept in RTC slow memory across deep sleep (lost on power-on / reset) ---- */
-static const uint32_t RTC_MAGIC = 0x56534C32;   /* "VSL2" (sleep2: layout + d0 seq fields) */
+static const uint32_t RTC_MAGIC = 0x56534C33;   /* "VSL3" (sleep3: + clock drift fields) */
 enum { JOBB_HIST0 = 1, JOBB_PV = 2 };
 struct RtcState {
     uint32_t magic;
@@ -361,6 +386,15 @@ struct RtcState {
     int32_t d0Ymd;             /* ymd assigned to that seq                      (NVS d0ymd) */
     int32_t rollYdayYmd;       /* day closed by a detected rollover whose day1 is still to publish */
     uint8_t rollTries;
+    /* sleep3: clock */
+    uint64_t lastSleepUs;      /* requested deep-sleep length of the last sleep */
+    uint64_t sleepUsSinceNtp;  /* deep-sleep time accumulated since the last NTP step */
+    float driftPpm;            /* RTC gain during deep sleep (+ = clock runs fast), compensated */
+    bool driftValid;
+    bool otherClockSet;        /* clock set by yard/time since the last NTP → skip drift estimate */
+    uint8_t clkSrc;            /* 0 none 1 ntp(udp) 2 yard 3 sntp */
+    bool timeUnsub;            /* yard/time unsubscribed in the persistent session */
+    uint32_t yardIgnored;
 };
 RTC_DATA_ATTR static RtcState rtc;
 
@@ -436,13 +470,103 @@ static void applyEpoch(time_t epoch) {
     tzset();
     g_clockOk = true;
     rtc.timeValid = true;                 /* sleep1: fallback clock source (NTP preferred) */
+    rtc.otherClockSet = true;             /* sleep3: next NTP step is not pure RTC drift */
+    rtc.clkSrc = 2;
     logf("STEP time mqtt ymd=%d", todayYmd());
     tryHist();
 }
 /* sleep1: blocking NTP sync with timeout. logs/stores the clock step = RTC drift since last sync */
 static void ntpCb(struct timeval *) { g_ntpSynced = true; }
+static int64_t nowUs() { struct timeval tv; gettimeofday(&tv, nullptr); return (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec; }
+static void setUs(int64_t us) {
+    struct timeval tv; tv.tv_sec = (time_t)(us / 1000000LL); tv.tv_usec = (suseconds_t)(us % 1000000LL);
+    settimeofday(&tv, nullptr);
+}
+/* sleep3: one SNTPv4 client request over UDP. returns true and the clock step applied (us). */
+static bool ntpQuick(uint32_t timeoutMs, int64_t *stepOut) {
+    IPAddress ip;
+    if (!WiFi.hostByName(NTP_SERVER1, ip) && !WiFi.hostByName(NTP_SERVER2, ip)) return false;
+    WiFiUDP udp;
+    if (!udp.begin(4123)) return false;
+    uint8_t pkt[48]; memset(pkt, 0, sizeof(pkt));
+    pkt[0] = 0x23;                                    /* LI 0, VN 4, mode 3 (client) */
+    while (udp.parsePacket() > 0) udp.clear();
+    int64_t t1 = nowUs();
+    udp.beginPacket(ip, 123); udp.write(pkt, sizeof(pkt));
+    if (!udp.endPacket()) { udp.stop(); return false; }
+    uint32_t t0 = millis();
+    bool got = false;
+    while (millis() - t0 < timeoutMs) {
+        if (udp.parsePacket() >= 48 && udp.read(pkt, 48) == 48) { got = true; break; }
+        delay(2);
+    }
+    int64_t t4 = nowUs();
+    udp.stop();
+    if (!got || (pkt[0] & 0x07) != 4 || pkt[1] == 0 || pkt[1] > 15) return false;
+    auto ts = [&](int o) -> int64_t {
+        uint32_t s = ((uint32_t)pkt[o] << 24) | ((uint32_t)pkt[o + 1] << 16) | ((uint32_t)pkt[o + 2] << 8) | pkt[o + 3];
+        uint32_t f = ((uint32_t)pkt[o + 4] << 24) | ((uint32_t)pkt[o + 5] << 16) | ((uint32_t)pkt[o + 6] << 8) | pkt[o + 7];
+        return ((int64_t)s - 2208988800LL) * 1000000LL + (int64_t)(((uint64_t)f * 1000000ULL) >> 32);
+    };
+    int64_t t2 = ts(32), t3 = ts(40);
+    if (t3 < 1700000000LL * 1000000LL) return false;
+    int64_t off = ((t2 - t1) + (t3 - t4)) / 2;         /* server - local */
+    setUs(nowUs() + off);
+    *stepOut = off;
+    return true;
+}
+/* sleep3: drift estimate from an NTP step. step = server - local (local fast → negative). */
+static void driftUpdate(int64_t stepUs) {
+    uint64_t sl = rtc.sleepUsSinceNtp;
+    bool use = !rtc.otherClockSet && sl >= (uint64_t)DRIFT_MIN_SLEEP_S * 1000000ULL;
+    if (use) {
+        double resid = -(double)stepUs * 1e6 / (double)sl;    /* ppm still uncorrected */
+        float old = rtc.driftPpm;
+        float np = rtc.driftValid ? old + 0.7f * (float)resid : (float)resid;
+        if (np > DRIFT_MAX_PPM) np = DRIFT_MAX_PPM;
+        if (np < -DRIFT_MAX_PPM) np = -DRIFT_MAX_PPM;
+        rtc.driftPpm = np;
+        rtc.driftValid = true;
+        int32_t stored = prefs.getInt("drift", INT32_MIN);
+        if (stored == INT32_MIN || labs((long)stored - (long)np) >= 200) prefs.putInt("drift", (int32_t)np);
+        logf("STEP drift step=%ldms over %lus sleep → resid %.0f ppm, comp %.0f → %.0f ppm",
+             (long)(stepUs / 1000), (unsigned long)(sl / 1000000ULL), resid, (double)old, (double)np);
+    } else {
+        logf("STEP drift skip (sleep %lus, other_set=%d)", (unsigned long)(sl / 1000000ULL), (int)rtc.otherClockSet);
+    }
+    rtc.sleepUsSinceNtp = 0;
+    rtc.otherClockSet = false;
+}
 static bool ntpSync(uint32_t timeoutMs) {
     if (WiFi.status() != WL_CONNECTED) return false;
+    {   /* sleep3: quick UDP NTP first */
+        uint32_t q0 = millis();
+        bool hadClock = clockReady();
+        int64_t step = 0;
+        if (ntpQuick(NTP_QUICK_TIMEOUT_MS, &step)) {
+            time_t nowS = time(nullptr);
+            if (hadClock) {
+                rtc.lastNtpAdjMs = (int32_t)(step / 1000);
+                driftUpdate(step);
+            } else {
+                rtc.sleepUsSinceNtp = 0;
+                rtc.otherClockSet = false;
+            }
+            long since = hadClock && rtc.lastNtp ? (long)(nowS - rtc.lastNtp) : 0;
+            rtc.lastNtp = nowS;
+            rtc.timeValid = true;
+            rtc.clkSrc = 1;
+            setenv("TZ", TZ_INFO, 1);
+            tzset();
+            g_clockOk = true;
+            g_ntpMs = millis() - q0;
+            logf("STEP ntp(udp) ok %lums today=%d step=%ldms over %lds", (unsigned long)g_ntpMs, todayYmd(),
+                 hadClock ? (long)(step / 1000) : 0L, since);
+            return true;
+        }
+        logf("NOTE ntp(udp) failed %lums — SNTP", (unsigned long)(millis() - q0));
+    }
+    uint32_t s0 = millis();
     struct timeval before; gettimeofday(&before, nullptr);
     int64_t m0 = esp_timer_get_time();
     bool hadClock = clockReady();
@@ -458,10 +582,13 @@ static bool ntpSync(uint32_t timeoutMs) {
     struct timeval after; gettimeofday(&after, nullptr);
     int64_t el = esp_timer_get_time() - m0;
     int64_t stepUs = ((int64_t)(after.tv_sec - before.tv_sec) * 1000000LL + (after.tv_usec - before.tv_usec)) - el;
-    if (hadClock) rtc.lastNtpAdjMs = (int32_t)(stepUs / 1000);
+    if (hadClock) { rtc.lastNtpAdjMs = (int32_t)(stepUs / 1000); driftUpdate(stepUs); }
+    else { rtc.sleepUsSinceNtp = 0; rtc.otherClockSet = false; }
     long since = hadClock ? (long)(before.tv_sec - rtc.lastNtp) : 0;
     rtc.lastNtp = after.tv_sec;
     rtc.timeValid = true;
+    rtc.clkSrc = 3;
+    g_ntpMs = millis() - s0;
     setenv("TZ", TZ_INFO, 1);
     tzset();
     g_clockOk = true;
@@ -677,6 +804,12 @@ static void mqttCb(char *topic, byte *payload, unsigned int len) {
         return;
     }
     if (!strcmp(topic, TOPIC_TIME)) {
+        /* sleep3: only a fallback clock — a retained/periodic yard/time used to reset the drifting
+         * RTC on long (job) wakes, which made ts_offset a 10-min sawtooth */
+        if (clockReady() && rtc.lastNtp && time(nullptr) - rtc.lastNtp < YARD_MAX_NTP_AGE_S) {
+            rtc.yardIgnored++;
+            return;
+        }
         time_t epoch = 0;
         if (tmp[0] == '{') {
             const char *p = strstr(tmp, "\"epoch\"");
@@ -709,12 +842,19 @@ static void mqttConnect() {
     mqtt.setCallback(mqttCb);
     mqtt.setKeepAlive(30);
     mqtt.setSocketTimeout(3);
-    mqtt.setBufferSize(1024); /* status JSON ~800 B + topic + header */
+    mqtt.setBufferSize(1280); /* status JSON ~900 B + topic + header */
     /* sleep1: no will (a sleeping node is not "offline"); persistent session queues QoS1 commands */
     if (mqtt.connect(MQTT_CLIENT, MQTT_USER, MQTT_PASS, nullptr, 0, false, nullptr, !MQTT_PERSISTENT)) {
         mqtt.subscribe(TOPIC_CMD, 1);
         mqtt.subscribe(TOPIC_LWT, 0);         /* flush check */
-        if (!clockReady()) mqtt.subscribe(TOPIC_TIME);   /* retained time only as a fallback clock */
+        bool ntpFresh = clockReady() && rtc.lastNtp && time(nullptr) - rtc.lastNtp < YARD_MAX_NTP_AGE_S;
+        if (!ntpFresh) {                            /* retained time only as a fallback clock */
+            mqtt.subscribe(TOPIC_TIME);
+            rtc.timeUnsub = false;
+        } else if (!rtc.timeUnsub) {
+            /* sleep3: persistent session keeps an old yard/time subscription → drop it once */
+            if (mqtt.unsubscribe(TOPIC_TIME)) { rtc.timeUnsub = true; logln("STEP yard/time unsubscribed"); }
+        }
         logln("STEP mqtt up");
     } else {
         logf("FAIL mqtt rc=%d", mqtt.state());
@@ -764,25 +904,27 @@ static const char *chargeName(uint8_t s) {
     }
 }
 
-static bool parseVictron(int di, const uint8_t *mfg, size_t mlen, int rssi,
-                         const char *addr, const char *name, uint8_t addrType) {
+/* sleep3: result codes (was bool). OTHER = Victron record that is not an Instant Readout (0x10) */
+enum { DEC_FAIL = 0, DEC_OK = 1, DEC_DUP = 2, DEC_OTHER = 3 };
+static int parseVictron(int di, const uint8_t *mfg, size_t mlen, int rssi,
+                        const char *addr, const char *name, uint8_t addrType, bool accumulate = true) {
     size_t off = 0;
     uint16_t cid = (uint16_t)mfg[0] | ((uint16_t)mfg[1] << 8);
     if (cid == VICTRON_CID) off = 2;
-    if (mlen <= off || mfg[off] != 0x10) return false;
+    if (mlen <= off || mfg[off] != 0x10) return DEC_OTHER;
     const uint8_t *p = mfg + off;
     size_t n = mlen - off;
-    if (n < 10) return false;
-    if (p[7] != g_dev[di].key[0]) return false;
+    if (n < 10) return DEC_FAIL;
+    if (p[7] != g_dev[di].key[0]) return DEC_FAIL;
     uint16_t model = (uint16_t)p[2] | ((uint16_t)p[3] << 8);
     uint8_t rec = p[4];
     uint16_t iv = (uint16_t)p[5] | ((uint16_t)p[6] << 8);
     size_t ctLen = n - 8;
-    if (ctLen < 8 || ctLen > 24) return false;
+    if (ctLen < 8 || ctLen > 24) return DEC_FAIL;
     uint8_t pt[32]; memset(pt, 0, sizeof(pt));
-    if (!aes128_ctr(g_dev[di].key, iv, p + 8, ctLen, pt)) return false;
+    if (!aes128_ctr(g_dev[di].key, iv, p + 8, ctLen, pt)) return DEC_FAIL;
     DevState &s = g_st[di];
-    if (s.seen && s.nonce == iv && (millis() - s.lastMs) < 400) return true;
+    if (s.seen && s.nonce == iv && (millis() - s.lastMs) < 400) return DEC_DUP;
     s.rssi = rssi; s.model = model; s.recType = rec; s.nonce = iv;
     s.lastMs = millis(); s.seen = true; s.addrType = addrType;
     strncpy(s.addr, addr, sizeof(s.addr) - 1);
@@ -814,7 +956,7 @@ static bool parseVictron(int di, const uint8_t *mfg, size_t mlen, int rssi,
         s.tempC = s.hasTemp ? aux / 100.0f - 273.15f : NAN;
         s.ok = !isnan(s.vbat);
     }
-    if (s.ok) {
+    if (s.ok && accumulate) {
         Acc &a = g_acc[di];
         if (!isnan(s.vbat)) { a.vbat += s.vbat; a.n++; }
         a.rssi += s.rssi;
@@ -826,15 +968,16 @@ static bool parseVictron(int di, const uint8_t *mfg, size_t mlen, int rssi,
             a.state = s.chargeState; a.err = s.chargerErr;
         } else if (s.hasTemp && !isnan(s.tempC)) { a.tempC += s.tempC; a.nTemp++; }
     }
-    return s.ok;
+    return s.ok ? DEC_OK : DEC_FAIL;
 }
 
 static int findDevByKeyCheck(const uint8_t *mfg, size_t mlen) {
     for (int i = 0; i < DEV_N; i++) {
         DevState tmp = g_st[i];
-        bool ok = parseVictron(i, mfg, mlen, 0, "", "", 0);
+        /* sleep3: probe without accumulating (the real call below accumulated it a second time) */
+        int r = parseVictron(i, mfg, mlen, 0, "", "", 0, false);
         g_st[i] = tmp;
-        if (ok) return i;
+        if (r == DEC_OK || r == DEC_DUP) return i;
     }
     return -1;
 }
@@ -854,12 +997,13 @@ class ScanCB : public NimBLEScanCallbacks {
         if (di < 0) di = findDevByKeyCheck(raw, md.size());
         if (di < 0) return;
         g_scanHits++;
-        if (parseVictron(di, raw, md.size(), dev->getRSSI(),
-                         addr.c_str(), dev->getName().c_str(),
-                         dev->getAddress().getType()))
-            g_decOk++;
-        else
-            g_decFail++;
+        int r = parseVictron(di, raw, md.size(), dev->getRSSI(),
+                             addr.c_str(), dev->getName().c_str(),
+                             dev->getAddress().getType());
+        if (r == DEC_OK) g_decOk++;
+        else if (r == DEC_DUP) g_decDup++;
+        else if (r == DEC_OTHER) g_decOther++;
+        else g_decFail++;
     }
 };
 static ScanCB g_scanCb;
@@ -886,8 +1030,8 @@ static void bleScanStart() {
     scan->setScanCallbacks(&g_scanCb, false);
     scan->setMaxResults(0);    /* callbacks only — default 0xFF stores every address forever */
     scan->setActiveScan(true); /* bleak-like; connectable ADV */
-    scan->setInterval(160);
-    scan->setWindow(80);
+    scan->setInterval(SCAN_INTERVAL);
+    scan->setWindow(SCAN_WINDOW);        /* sleep3: 100 % duty */
     scan->setDuplicateFilter(false);
     scan->start(0, false);
     g_lastScanRst = millis();
@@ -943,15 +1087,16 @@ static void publishLive() {
 /* sleep1: one status per wake. "vbat" = HUZZAH32 VBAT pin (board battery), read before the radios */
 static void publishStatus() {
     if (!mqtt.connected()) return;
-    char buf[900];
+    char buf[1100];
     long now = clockReady() ? (long)time(nullptr) : 0;
     int n = snprintf(buf, sizeof(buf),
-             "{\"src\":\"victron_ble\",\"board\":\"feather\",\"fw\":\"sleep2\",\"ts\":%ld,"
+             "{\"src\":\"victron_ble\",\"board\":\"feather\",\"fw\":\"sleep3\",\"ts\":%ld,"
              "\"boot\":%lu,\"wake\":\"%02d:%02d\",\"awake_ms\":%lu,\"prev_awake_ms\":%lu,\"wdt\":%lu,"
              "\"adv_mppt_n\":%d,\"adv_sense_n\":%d,"
              "\"mppt_seen\":%s,\"sense_seen\":%s,\"mppt_rssi\":%d,\"sense_rssi\":%d,"
-             "\"hits\":%lu,\"dec_ok\":%lu,\"dec_fail\":%lu,"
-             "\"clock\":\"%s\",\"ntp_age\":%ld,\"ntp_adj_ms\":%ld,\"today\":%d,\"yday\":%d,"
+             "\"hits\":%lu,\"dec_ok\":%lu,\"dec_fail\":%lu,\"dec_dup\":%lu,\"dec_other\":%lu,"
+             "\"clock\":\"%s\",\"clk\":\"%s\",\"ntp_ms\":%lu,\"drift_ppm\":%ld,\"yard_ign\":%lu,"
+             "\"ntp_age\":%ld,\"ntp_adj_ms\":%ld,\"today\":%d,\"yday\":%d,"
              "\"day0_done\":%ld,\"yday_done\":%ld,\"job_pend\":%u,\"jobs\":%u,"
              "\"wifi_rssi\":%d,\"wifi_ms\":%lu,\"wifi_fast\":%s,\"vbat\":%.2f,\"ip\":\"%s\","
              "\"heap\":%lu,\"heap_min\":%lu,\"rst\":%d}",
@@ -963,7 +1108,12 @@ static void publishStatus() {
              g_st[DEV_MPPT].seen ? g_st[DEV_MPPT].rssi : 0,
              g_st[DEV_SENSE].seen ? g_st[DEV_SENSE].rssi : 0,
              (unsigned long)g_scanHits, (unsigned long)g_decOk, (unsigned long)g_decFail,
-             g_clockOk ? "ok" : "wait", (rtc.lastNtp && now) ? (long)(now - rtc.lastNtp) : -1L,
+             (unsigned long)g_decDup, (unsigned long)g_decOther,
+             g_clockOk ? "ok" : "wait",
+             rtc.clkSrc == 1 ? "ntp" : rtc.clkSrc == 2 ? "yard" : rtc.clkSrc == 3 ? "sntp" : "none",
+             (unsigned long)g_ntpMs, rtc.driftValid ? (long)lroundf(rtc.driftPpm) : 0L,
+             (unsigned long)rtc.yardIgnored,
+             (rtc.lastNtp && now) ? (long)(now - rtc.lastNtp) : -1L,
              (long)rtc.lastNtpAdjMs, todayYmd(), yesterdayYmd(),
              (long)rtc.day0DoneYmd, (long)rtc.ydayDoneYmd, (unsigned)rtc.jobPend, (unsigned)g_jobsRun,
              WiFi.RSSI(), (unsigned long)g_wifiMs, g_wifiFast && !g_wifiFallback ? "true" : "false",
@@ -1986,6 +2136,7 @@ static void awakeWdtCb(void *) {
     rtc.wdtTrips++;
     rtc.prevAwakeMs = millis();
     uint64_t us = sleepUsToBoundary(nullptr);
+    rtc.lastSleepUs = us;                         /* sleep3: drift compensation on the next wake */
     Serial.printf("WDT awake limit hit at %lums — forced deep sleep %llums\n",
                   (unsigned long)millis(), (unsigned long long)(us / 1000));
     Serial.flush();
@@ -2235,6 +2386,7 @@ static void goSleep() {
     led(false);
     rtc.prevAwakeMs = millis();
     uint64_t us = sleepUsToBoundary(nullptr);          /* recomputed after the shutdown work */
+    rtc.lastSleepUs = us;                              /* sleep3: drift compensation on the next wake */
     logf("STEP sleep %llums (awake %lums)", (unsigned long long)(us / 1000), (unsigned long)millis());
     Serial.flush();
     esp_sleep_enable_timer_wakeup(us);
@@ -2253,6 +2405,17 @@ void setup() {
         rtc.d0Seq = -1;
     }
     rtc.boots++;
+    /* sleep3: RTC drift compensation. During deep sleep the clock advanced by ~lastSleepUs as
+     * measured by the RC slow clock; driftPpm (from the NTP steps) is how much too fast that is. */
+    int64_t driftCorrUs = 0;
+    if (warm && rtc.lastSleepUs) {
+        if (rtc.driftValid && rtc.timeValid && time(nullptr) >= 1700000000) {
+            driftCorrUs = (int64_t)((double)rtc.lastSleepUs * (double)rtc.driftPpm / 1e6);
+            if (driftCorrUs) setUs(nowUs() - driftCorrUs);
+        }
+        rtc.sleepUsSinceNtp += rtc.lastSleepUs;
+    }
+    rtc.lastSleepUs = 0;
     awakeWdtArm(g_awakeLimitMs);
     setenv("TZ", TZ_INFO, 1);
     tzset();
@@ -2264,9 +2427,14 @@ void setup() {
     if (!warm) {
         prefs.remove("today");              /* old single-slot keys, replaced by ring h00..h39 */
         prefs.remove("yday");
-        Serial.println("\n=== HUZZAH32 Victron ADV + GATT, deep-sleep 1-min (sleep2) ===");
+        Serial.println("\n=== HUZZAH32 Victron ADV + GATT, deep-sleep 1-min (sleep3) ===");
     }
     if (!warm || rtc.d0Seq < 0) d0Load();   /* sleep2: last day0 seq/ymd survive power loss */
+    if (!warm) {                            /* sleep3: last drift estimate survives power loss */
+        int32_t dp = prefs.getInt("drift", INT32_MIN);
+        if (dp != INT32_MIN && dp >= -DRIFT_MAX_PPM && dp <= DRIFT_MAX_PPM) { rtc.driftPpm = (float)dp; rtc.driftValid = true; }
+    }
+    if (driftCorrUs) logf("STEP drift comp %ldms (%.0f ppm)", (long)(driftCorrUs / 1000), (double)rtc.driftPpm);
     logf("STEP wake #%lu rst=%d warm=%d clock=%d vboard=%.2f prev_awake=%lums wdt=%lu",
          (unsigned long)rtc.boots, (int)rr, (int)warm, (int)g_clockOk, (double)g_boardV,
          (unsigned long)rtc.prevAwakeMs, (unsigned long)rtc.wdtTrips);
