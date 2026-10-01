@@ -100,7 +100,6 @@ Victron 은 history 의 하루를 **자정이 아니라 저녁에 PV 가 꺼진 
 - 상태 파일: `victron_days.json`, `victron_status_hist.json`, `victron_pv.json`, `victron_board_24h.jsonl` (모두 git 제외)
 - InfluxDB 측정값 이름은 `victron_mppt`, `victron_sense` 를 가정 (MQTT → Influx 적재는 별도, 예: Telegraf)
 
-|---|---|
 | <img src="dashboard.png" width="360" alt="dashboard"> | <img src="dashboard-status.png" width="360" alt="dashboard-status"> |
 
 ## 메모
