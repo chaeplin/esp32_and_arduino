@@ -14,9 +14,9 @@ Korean: [README.ko.md](README.ko.md)
 
 Local ESP32 (Adafruit HUZZAH32) bridge for Victron Instant Readout.
 
-Decrypts BLE advertisements, publishes MQTT JSON, and opens a short GATT session only for **yesterday’s** history (`hist`) or PV registers (`pv`).
+Decrypts BLE advertisements, publishes MQTT JSON, and opens short GATT sessions for **daily history (up to 30 days)** and PV registers.
 
-Built with [SuperGrok](https://grok.com) from captured ADV / GATT packets and Feather serial logs. Not an official Victron SDK.
+Built with [SuperGrok](https://grok.com) / Grokbot from captured ADV / GATT packets and Feather serial logs. Not an official Victron SDK.
 
 [README](./victron-ble-mqtt/README.md) · [한국어](./victron-ble-mqtt/README.ko.md) · MIT
 

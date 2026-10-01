@@ -14,9 +14,9 @@ ESP32 / Arduino 스케치와 로컬 브리지 모음입니다. 프로젝트는 �
 
 Victron Instant Readout용 로컬 ESP32(Adafruit HUZZAH32) 브리지.
 
-BLE 광고를 복호화해 MQTT JSON으로 올리고, GATT는 **어제** 이력(`hist`)이나 PV 레지스터(`pv`)가 필요할 때만 짧게 붙습니다.
+BLE 광고를 복호화해 MQTT JSON으로 올리고, GATT는 **일일 이력(최대 30일)** 과 PV 레지스터가 필요할 때만 짧게 붙습니다.
 
-ADV / GATT 패킷 캡처와 Feather 시리얼 로그를 [슈퍼그록(SuperGrok)](https://grok.com)과 맞춰 가며 만들었습니다. 공식 Victron SDK가 아닙니다.
+ADV / GATT 패킷 캡처와 Feather 시리얼 로그를 [슈퍼그록(SuperGrok)](https://grok.com) / Grokbot과 맞춰 가며 만들었습니다. 공식 Victron SDK가 아닙니다.
 
 [README](./victron-ble-mqtt/README.md) · [한국어](./victron-ble-mqtt/README.ko.md) · MIT
 
