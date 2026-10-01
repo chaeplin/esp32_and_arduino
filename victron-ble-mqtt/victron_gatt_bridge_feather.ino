@@ -3,15 +3,18 @@
  * Victron ADV IR 10s + GATT cmd
  *
  * 평소: ADV 10초 평균 → victron/mppt, victron/sense
- * {"cmd":"hist"} day0=오늘 0x1050, day1=어제 0x1051.
- *   앱과 같이 0부터 읽음. 어제 = day1.
- *   NTP(KST) 날짜로 NVS ymd 비교. 같으면 GATT 없이 NVS → MQTT.
- *   다르거나 없으면 GATT 0x1050 → 0x1051 → EDD1 → EDD0 → NVS → 끊고 MQTT.
+ * {"cmd":"hist"} 또는 {"cmd":"hist","days":N}
+ *   day0=오늘 0x1050, day1=어제 0x1051, ... dayN=0x1050+N (N<=30, 0x106E).
+ *   한 GATT 세션에서 하루씩 순서대로: 요청 → 그 날 응답 파싱 완료(또는 3초 타임아웃,
+ *   최대 2회 재시도) → 다음 날. ymd = 세션 시작 시각의 KST 날짜 - day.
+ *   닫힌 날(day>=1)은 NVS 링 캐시(h00..h39)에 저장. day1..N 이 모두 캐시에 있으면
+ *   GATT 없이 NVS → MQTT. 아니면 캐시에 없는 날 + day0 만 GATT 로 읽고 끊은 뒤 MQTT.
+ *   day 마다 victron/mppt/hist 메시지 1개.
  * {"cmd":"pv"} 현재 PV V/W/A → disconnect → victron/mppt/pv (없는 값은 null)
  * PIN 은 VICTRON_PIN. NTP + yard/time 보조.
  *
  * Arduino IDE: Adafruit ESP32 Feather, NimBLE-Arduino 2.x + PubSubClient
- * MQTT / Wi-Fi / PIN / MAC / AES 키는 아래 플레이스홀더를 로컬 값으로 바꿔 쓴다.
+ * MQTT: set WIFI_*/MQTT_* locally. Do not commit secrets.
  */
 
 #include <WiFi.h>
@@ -26,6 +29,7 @@
 #include <math.h>
 #include <time.h>
 #include <sys/time.h>
+#include <esp_system.h>
 
 static const char *WIFI_SSID    = "YOUR_WIFI_SSID";
 static const char *WIFI_PASS    = "YOUR_WIFI_PASSWORD";
@@ -33,7 +37,7 @@ static const char *MQTT_HOST    = "YOUR_MQTT_HOST";
 static const uint16_t MQTT_PORT = 1883;
 static const char *MQTT_USER    = "YOUR_MQTT_USER";
 static const char *MQTT_PASS    = "YOUR_MQTT_PASSWORD";
-static const char *MQTT_CLIENT  = "victron-gatt-bridge";
+static const char *MQTT_CLIENT  = "huzzah-victron-gatt";
 
 static const char *TOPIC_MPPT   = "victron/mppt";
 static const char *TOPIC_SENSE  = "victron/sense";
@@ -45,7 +49,9 @@ static const char *TOPIC_CMD    = "victron/gatt/cmd";
 static const char *TOPIC_LWT    = "victron/lwt";
 static const char *TOPIC_TIME   = "yard/time";
 
-#define VICTRON_PIN 000000u
+#ifndef VICTRON_PIN
+#define VICTRON_PIN 000000u  /* BLE PIN is 6 digits */
+#endif
 static const uint32_t g_pin = VICTRON_PIN;
 
 static const int PIN_LED  = 13;
@@ -54,10 +60,13 @@ static const uint16_t VICTRON_CID = 0x02E1;
 static const uint32_t LIVE_MS = 10000;
 static const uint32_t STALE_MS = 8000;
 
-static const uint16_t REG_TODAY = 0x1050; /* HISTORY_DAY00 = today */
-static const uint16_t REG_YDAY  = 0x1051; /* HISTORY_DAY01 = yesterday */
-static const uint16_t REG_TODAY_X = 0x10A0; /* app pairs 1050+10A0 */
-static const uint16_t REG_YDAY_X  = 0x10A1;
+
+/* VE.Direct HEX / VREG (BlueSolar-HEX-protocol.pdf):
+ *   0x1050..0x106E  daily history record, 34 bytes (0x1050=today, 0x1051=yesterday, ...)
+ *   0x10A0..0x10BE  daily MPPT (per-tracker) history — doc: only on multi-tracker units (MPPT RS).
+ *                   VictronConnect asks 1050+10A0 in pairs, so we do the same by default. */
+static const uint16_t REG_HIST_DAY0   = 0x1050;
+static const uint16_t REG_HIST_MPPT0  = 0x10A0;
 static const uint16_t REG_EDD1 = 0xEDD1; /* yield yesterday */
 static const uint16_t REG_EDD0 = 0xEDD0; /* pmax yesterday */
 static const uint16_t REG_EDD3 = 0xEDD3; /* yield today */
@@ -66,14 +75,70 @@ static const uint16_t REG_PV_V = 0xEDBB;
 static const uint16_t REG_PV_W = 0xEDBC;
 static const uint16_t REG_PV_A = 0xEDBD;
 
+#define HIST_MAX_DAYS 30            /* 0x1050+30 = 0x106E, device keeps 30 days + today */
+#ifndef HIST_DAYS
+#define HIST_DAYS 7                 /* default N: read day0..day N */
+#endif
+#ifndef HIST_ASK_MPPT_X
+#define HIST_ASK_MPPT_X 0           /* rev5: off. 0x10A0 answered 09 flag 01 (unknown id) on this MPPT */
+#endif
+#ifndef HIST_DEBUG_FRAMES
+#define HIST_DEBUG_FRAMES 2         /* 0=off 1=every 08/09 frame 2=skip unsolicited live frames (s=03) */
+#endif
+#ifndef HIST_DAYS_PER_SESSION
+#define HIST_DAYS_PER_SESSION 16    /* device drops the link at ~10 s → read K days, reconnect, resume */
+#endif
+#ifndef HIST_WRITE_CHARS
+#define HIST_WRITE_CHARS 1          /* first hist attempt target: 1=0003 2=0004 3=both. rev4 log: writing
+                                       both made the device answer twice (dup page ~1.5 s later) */
+#endif
+#ifndef PV_WRITE_CHARS
+#define PV_WRITE_CHARS HIST_WRITE_CHARS  /* rev6: pv GETs go to 0003 only (replies arrive on 0003; both = dup reply) */
+#endif
+#ifndef PV_SEQ
+#define PV_SEQ 0x01                 /* rev10: fixed seq for every pv get (incl. retries). EDBB only ever
+                                       answered s=01; s=02/s=04 got no reply */
+#endif
+#ifndef PV_EDBC_WAIT_MS
+#define PV_EDBC_WAIT_MS 3000        /* rev11: EDBC is never requested (get → 09 flag 01); wait this long
+                                       after EDBB is done for an unsolicited s=03 push (capped at PV_SESSION_MS) */
+#endif
+#ifndef INIT_BULK_TRIM
+#define INIT_BULK_TRIM 1            /* drop dangling "05 00" at the end of the 20-byte 0004 init chunk */
+#endif
+static const uint32_t HIST_DAY_TIMEOUT_MS = 4000;  /* per attempt; history page took >1.5 s in rev4 */
+static const uint32_t HIST_GAP_MS         = 150;   /* gap after a day closes before the next request */
+static const uint32_t HIST_QUIET_MS       = 150;   /* no *reply* frames (live s=03 ignored) for this long */
+static const uint32_t HIST_KEEPALIVE_MS   = 0;     /* f941 keepalive (rev3 guess) — off: drop came 260 ms after it */
+static const uint32_t HIST_SESSION_MS     = 6500;  /* stop sending new requests after this (from session start) */
+static const uint32_t HIST_SESSION_END_MS = 7500;  /* ... and disconnect cleanly at this point */
+static const uint32_t HIST_RECONNECT_MS   = 2500;  /* gap before the next resume session */
+static const uint8_t  HIST_MAX_SESSIONS   = 20;    /* per hist command */
+static const uint32_t PV_REPLY_TIMEOUT_MS = 1000;  /* rev6: wait for the 08/09 of the current pv reg */
+static const uint8_t  PV_RETRIES          = 1;     /* extra attempts per pv reg after a timeout */
+static const uint32_t PV_GAP_MS           = 100;   /* gap after a pv reg closes before the next request */
+static const uint32_t PV_SESSION_MS       = 6500;  /* no pv request whose wait would end after this (from connect) */
+static const uint32_t PV_FB_WAIT_MS       = 1000;  /* seq=00 fallback wait */
+static const uint8_t  HIST_DAY_RETRIES    = 2;     /* extra attempts per day (forms: 82 pair, 81 concat s=03, 81 single) */
+static const uint8_t  HIST_EMPTY_STOP     = 2;     /* stop after N consecutive empty/failed days */
+static const uint32_t HIST_FB_WAIT_MS     = 1500;  /* EDDx fallback wait */
+static const uint8_t  HIST_CACHE_VER      = 3;     /* rev9: + ibat max (rev8 = 2) — bump on layout change */
+static const int      HIST_CACHE_SLOTS    = 40;    /* NVS ring h00..h39, keyed by day number */
+static const uint32_t SCAN_RESTART_MS     = 600000UL; /* clear scan state every 10 min */
+static const uint8_t  CONN_FAIL_RESET     = 3;     /* host reset after N consecutive GATT failures */
+static const int      MAX_GET_REGS        = 8;     /* regs per request packet (<=23, CBOR array head) */
+
 static const char *SVC_APP = "306b0001-b081-4037-83dc-e59fcc3cdfd0";
 static const char *CHR_2   = "306b0002-b081-4037-83dc-e59fcc3cdfd0";
 static const char *CHR_3   = "306b0003-b081-4037-83dc-e59fcc3cdfd0";
 static const char *CHR_4   = "306b0004-b081-4037-83dc-e59fcc3cdfd0";
 
+
 enum { DEV_MPPT = 0, DEV_SENSE = 1, DEV_N = 2 };
 enum { MODE_ADV = 0, MODE_GATT = 1 };
 enum { JOB_NONE = 0, JOB_HIST = 1, JOB_PV = 2 };
+/* per-day state inside one hist session */
+enum { DAY_PENDING = 0, DAY_OK = 1, DAY_EMPTY = 2, DAY_FAIL = 3, DAY_CACHED = 4, DAY_SKIP = 5 };
 
 struct VictronDev {
     const char *id, *label, *macHex;
@@ -102,20 +167,33 @@ struct Acc {
     uint8_t state, err;
 };
 struct DayRec {
-    bool ok, hasYield, hasPmax;
+    bool ok, hasYield, hasPmax, hasSeq;
     int ymd;
+    uint16_t seq;          /* day sequence number (record byte 32), 0..364 */
     float yieldKwh, consumedKwh, pmaxW, vpvMax, vbatMax, vbatMin;
+    /* rev8: from the history page only (EDDx fallback leaves hasPage=false → null in JSON) */
+    bool hasPage;
+    uint8_t cacheVer;      /* HIST_CACHE_VER when written to NVS; older entries = miss */
+    uint8_t err[4];        /* record bytes 14..17 (error 0..3) */
+    uint16_t tBulk, tAbs, tFloat;   /* minutes, record bytes 18/20/22; 0xFFFF = unknown */
+    uint16_t iBatMax;      /* rev9: battery max current, record byte 28, 0.1 A; 0xFFFF = unknown */
 };
 
 static DevState g_st[DEV_N];
 static Acc g_acc[DEV_N];
-static DayRec g_today, g_yday;
+static DayRec g_day[HIST_MAX_DAYS + 1];
+static uint8_t g_dayState[HIST_MAX_DAYS + 1];
+static uint8_t g_dayErr[HIST_MAX_DAYS + 1];  /* last 0x09 flag value for this day (0 = none) */
+static uint8_t g_dayTries[HIST_MAX_DAYS + 1];/* attempts across sessions */
+static bool g_dayPub[HIST_MAX_DAYS + 1];     /* already published in this hist job */
+static DayRec &g_today = g_day[0];
+static DayRec &g_yday  = g_day[1];
 
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
 Preferences prefs;
 
-static uint32_t g_bootMs, g_lastLive, g_lastWifi, g_lastStatus;
+static uint32_t g_bootMs, g_lastLive, g_lastWifi, g_lastStatus, g_lastScanRst;
 static uint32_t g_scanHits, g_decOk, g_decFail, g_gattStartMs, g_histNextMs;
 static uint8_t g_connFails;
 static int g_mode = MODE_ADV, g_job = JOB_NONE;
@@ -123,14 +201,54 @@ static volatile bool g_wantHist, g_wantPv, g_wantUnpair, g_enc, g_sawNotify, g_h
 static volatile bool g_histQueued = false;
 static bool g_clockOk = false;
 static bool g_ntpStarted = false;
-static uint8_t g_histPhase = 0;
-static int g_pvPhase = 0;
+static int g_pvPhase = 0;                /* rev7: 0..1 = index into PV_REGS being read, PV_NREGS = done */
+static bool g_pvFbSent = false;
+static uint8_t g_pvTry = 0;              /* requests sent for the current pv reg (0 = not sent yet) */
+static uint8_t g_pvErr = 0;              /* 09 flag received for the current pv reg (0 = none) */
+static uint32_t g_pvDeadline = 0;
+static bool g_pvEdbcWait = false;        /* rev11: waiting for the unsolicited EDBC push */
+static bool g_pvEdbcDone = false;        /* rev11: EDBC wait finished (got it or timed out) */
+static uint32_t g_pvEdbcStart = 0, g_pvEdbcUntil = 0;
+/* rev7: EDBD (PV current) dropped — this SmartSolar never answers it (no 08, no 09). An EDBD 08
+ * that arrives anyway is still accepted as ipv in parseFrames; otherwise pubPv derives ipv. */
+/* rev11: EDBC (PV power) is not requested either — the get is rejected (09 flag 01). It only
+ * arrives as an unsolicited s=03 push (~+1115 ms); pvTick waits for it after EDBB. */
+static const uint16_t PV_REGS[] = { REG_PV_V };
+static const int PV_NREGS = (int)(sizeof(PV_REGS) / sizeof(PV_REGS[0]));
+/* hist session */
+static int g_histReqDays = HIST_DAYS;   /* from cmd */
+static int g_histN = HIST_DAYS;         /* this session: day0..g_histN */
+static time_t g_histBase;               /* epoch at session start → ymd per day */
+static int g_histDay = -1;              /* day currently requested, -1 = not started */
+static uint8_t g_histTry, g_histEmptyRun;
+static bool g_histNeedSend, g_histFbSent;
+static uint32_t g_lastRxMs, g_lastTxMs;           /* loop-side timestamps for pacing */
+static uint32_t g_lastReplyMs;                    /* last non-live frame (reply / error / hist page) */
+static bool g_histCont;                           /* next hist session resumes the current job */
+static uint8_t g_histSessions, g_histSessDays;    /* sessions in this job, days closed this session */
+static bool g_histSessStop;                       /* no new requests in this session */
+static uint8_t g_wrMask = 3;                      /* wrBoth targets: bit0 0003, bit1 0004 */
+static uint8_t g_lastTxSeq;                       /* seq of the last getRegs request */
+static uint32_t g_rxBytesCh[3];                   /* notify bytes per char 0002/0003/0004 */
+static uint32_t g_histDeadline, g_histFbUntil, g_histBudgetMs = 28000;
+/* disconnect is only flagged in the NimBLE host task and handled in loop() */
+static volatile bool g_peerDrop = false;
+static volatile int g_dropReason = 0;
+static NimBLEClient *volatile g_dropCli = nullptr;
+
 static NimBLEClient *g_cli = nullptr;
 static NimBLERemoteCharacteristic *g_chCtrl, *g_chCmd, *g_chBulk;
 static uint8_t g_seq = 1;
-static uint8_t g_rx[512];
-static volatile uint16_t g_rxLen;
-static uint8_t g_parse[768];
+static int g_seqFixed = -1;              /* rev10: >=0 → getRegs uses this seq and leaves g_seq alone */
+/* notify → loop hand-off. onNotify runs in the NimBLE host task (core 0), loop on core 1:
+ * noInterrupts() only masks the local core, so use a spinlock. */
+static const uint16_t RX_CAP = 2048;
+static const uint16_t PARSE_CAP = 3072;
+static portMUX_TYPE g_rxMux = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t g_rx[RX_CAP];
+static uint16_t g_rxLen;               /* guarded by g_rxMux */
+static uint32_t g_rxOvf, g_parseOvf;      /* g_rxOvf under g_rxMux, g_parseOvf loop only */
+static uint8_t g_parse[PARSE_CAP];     /* loop task only */
 static uint16_t g_parseLen;
 static bool g_havePvV, g_havePvW, g_havePvA;
 static float g_pvV, g_pvWatt, g_pvA;
@@ -138,8 +256,8 @@ static float g_pvV, g_pvWatt, g_pvA;
 static void led(bool on) { digitalWrite(PIN_LED, on ? HIGH : LOW); }
 static float boardV() { return analogRead(PIN_VBAT) * (3.3f / 4095.0f) * 2.0f; }
 
-static void pubYday();
 static void tryHist();
+static void pubDay(const DayRec &r, int day, const char *src);
 
 static void logln(const char *s) {
     /* GATT STEP/RX/TX 는 시리얼만. MQTT 는 mppt/sense/status/hist/pv */
@@ -211,33 +329,93 @@ static void ntpPoll() {
     tryHist();
 }
 
+
+/* ymd of "day d back" from base epoch. noon avoids any DST/edge issue. */
+static int ymdForDay(time_t base, int d) {
+    if (base < 1700000000) return 0;
+    struct tm t; localtime_r(&base, &t);
+    t.tm_hour = 12; t.tm_min = 0; t.tm_sec = 0; t.tm_isdst = -1;
+    t.tm_mday -= d;
+    time_t x = mktime(&t);
+    localtime_r(&x, &t);
+    return tmYmd(&t);
+}
+/* days since 1970-01-01 for a yyyymmdd (civil calendar) */
+static long ymdDays(int ymd) {
+    int y = ymd / 10000, m = (ymd / 100) % 100, d = ymd % 100;
+    y -= m <= 2;
+    long era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (long)doe - 719468;
+}
+/* NVS ring cache of closed days. key = "hNN", NN = dayNumber % 40; ymd inside validates. */
+static void cacheKey(int ymd, char *k, size_t n) {
+    long dn = ymdDays(ymd);
+    snprintf(k, n, "h%02ld", ((dn % HIST_CACHE_SLOTS) + HIST_CACHE_SLOTS) % HIST_CACHE_SLOTS);
+}
+static void cacheSave(const DayRec &r) {
+    if (!r.ok || !r.ymd) return;
+    char k[8]; cacheKey(r.ymd, k, sizeof(k));
+    DayRec rec;
+    memcpy(&rec, &r, sizeof(rec));        /* byte copy so the memcmp below also sees padding */
+    rec.cacheVer = HIST_CACHE_VER;
+    DayRec old;
+    if (prefs.getBytes(k, &old, sizeof(old)) == sizeof(old) && !memcmp(&old, &rec, sizeof(rec))) return;
+    prefs.putBytes(k, &rec, sizeof(rec));
+}
+static bool cacheLoad(int ymd, DayRec &out) {
+    if (!ymd) return false;
+    char k[8]; cacheKey(ymd, k, sizeof(k));
+    DayRec tmp;
+    /* rev7 entries are shorter (size mismatch) → miss; cacheVer guards future same-size changes */
+    if (prefs.getBytesLength(k) != sizeof(tmp)) return false;
+    if (prefs.getBytes(k, &tmp, sizeof(tmp)) != sizeof(tmp)) return false;
+    if (tmp.cacheVer != HIST_CACHE_VER) return false;
+    if (!tmp.ok || tmp.ymd != ymd) return false;
+    out = tmp;
+    return true;
+}
+static void cacheClear() {
+    char k[8];
+    for (int i = 0; i < HIST_CACHE_SLOTS; i++) {
+        snprintf(k, sizeof(k), "h%02d", i);
+        prefs.remove(k);
+    }
+}
+
 /* hist cmd: NTP/yard-time 날짜가 있어야 NVS 비교.
- * 어제 NVS가 있으면 GATT skip. 없으면 day0+day1 GET. */
+ * day1..N 이 모두 NVS 캐시에 있으면 GATT skip. 없으면 GATT 로 day0 + 빠진 날. */
 static void tryHist() {
     if (!g_histQueued) return;
     if (g_mode == MODE_GATT) return;
-    int y = yesterdayYmd();
-    if (!y) {
+    if (!clockReady()) {
         logln("WAIT clock — hist queued (NTP or yard/time)");
         return;
     }
-    /* today 슬롯 ymd가 어제면 마감 전 스냅샷이다. 승격 금지, GATT 다시. */
-    if (g_today.ok && g_today.ymd == y) {
-        logf("NVS drop open-today %d — not closed yesterday", y);
-        memset(&g_today, 0, sizeof(g_today));
-        prefs.remove("today");
-        if (g_yday.ymd == y) {
-            memset(&g_yday, 0, sizeof(g_yday));
-            prefs.remove("yday");
-        }
-    }
     g_histQueued = false;
-    if (g_yday.ok && g_yday.ymd == y) {
-        logf("NVS hit yesterday %d — GATT skip", y);
-        pubYday();
+    int n = g_histReqDays;
+    if (n < 0) n = 0;
+    if (n > HIST_MAX_DAYS) n = HIST_MAX_DAYS;
+    time_t now = time(nullptr);
+    int missing = 0;
+    DayRec r;
+    for (int d = 1; d <= n; d++)
+        if (!cacheLoad(ymdForDay(now, d), r)) missing++;
+    if (n >= 1 && !missing) {
+        /* rev10: day1..N from NVS right away, then GATT for day0 only so today is published too */
+        logf("NVS hit day1..%d — GATT day0 only", n);
+        for (int d = 1; d <= n; d++)
+            if (cacheLoad(ymdForDay(now, d), r)) pubDay(r, d, "nvs");
+        g_histN = 0;
+        g_histCont = false;
+        g_wantHist = true;
         return;
     }
-    logf("NVS miss yday=%d want=%d — GATT day0+day1", g_yday.ymd, y);
+    logf("NVS miss %d/%d — GATT day0..%d", missing, n, n);
+    g_histN = n;
+    g_histCont = false;                       /* new job (a running resume chain is replaced) */
     g_wantHist = true;
 }
 
@@ -290,8 +468,15 @@ static void mqttCb(char *topic, byte *payload, unsigned int len) {
     for (char *p = tmp; *p; ++p) if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
     logf("CMD %s", tmp);
     if (strstr(tmp, "unpair")) g_wantUnpair = true;
-    else if (strstr(tmp, "\"cmd\":\"pv\"") || !strcmp(tmp, "pv")) g_wantPv = true;
+    else if (strstr(tmp, "pv")) g_wantPv = true;
     else if (strstr(tmp, "hist")) {
+        /* optional "days":N (0..30). default HIST_DAYS */
+        int days = HIST_DAYS;
+        const char *pd = strstr(tmp, "\"days\"");
+        if (pd && (pd = strchr(pd, ':'))) days = (int)strtol(pd + 1, nullptr, 10);
+        if (days < 0) days = 0;
+        if (days > HIST_MAX_DAYS) days = HIST_MAX_DAYS;
+        g_histReqDays = days;
         g_histQueued = true;
         tryHist();
     }
@@ -302,7 +487,7 @@ static void mqttConnect() {
     mqtt.setServer(MQTT_HOST, MQTT_PORT);
     mqtt.setCallback(mqttCb);
     mqtt.setKeepAlive(30);
-    mqtt.setBufferSize(768);
+    mqtt.setBufferSize(1024); /* status JSON ~600 B + topic + header */
     if (mqtt.connect(MQTT_CLIENT, MQTT_USER, MQTT_PASS, TOPIC_LWT, 0, true, "offline")) {
         mqtt.publish(TOPIC_LWT, "online", true);
         mqtt.subscribe(TOPIC_CMD);
@@ -480,11 +665,13 @@ static void bleScanStart() {
 
     NimBLEScan *scan = NimBLEDevice::getScan();
     scan->setScanCallbacks(&g_scanCb, false);
+    scan->setMaxResults(0);    /* callbacks only — default 0xFF stores every address forever */
     scan->setActiveScan(true); /* bleak-like; connectable ADV */
     scan->setInterval(160);
     scan->setWindow(80);
     scan->setDuplicateFilter(false);
     scan->start(0, false);
+    g_lastScanRst = millis();
 }
 static void bleScanStop() {
     NimBLEScan *s = NimBLEDevice::getScan();
@@ -502,11 +689,11 @@ static void publishLive() {
     Acc &m = g_acc[DEV_MPPT];
     if (m.n > 0) {
         snprintf(buf, sizeof(buf),
-                 "{\"id\":\"mppt\",\"src\":\"victron_ble\",\"sn\":\"%s\","
+                 "{\"id\":\"mppt\",\"src\":\"victron_ble\",\"sn\":\"YOUR_MPPT_SN\","
                  "\"model\":\"MPPT 75/15\",\"mac\":\"%s\",\"rssi\":%d,"
                  "\"vbat\":%.2f,\"ibat\":%.2f,\"power\":%.0f,\"yield_wh\":%.0f,"
                  "\"load_a\":%.1f,\"state\":\"%s\",\"state_n\":%u,\"error\":%u,\"n\":%d}",
-                 g_dev[DEV_MPPT].label, g_st[DEV_MPPT].addr, m.n ? (int)(m.rssi / m.n) : 0,
+                 g_st[DEV_MPPT].addr, m.n ? (int)(m.rssi / m.n) : 0,
                  m.vbat / m.n, m.n ? m.ibat / m.n : NAN,
                  m.n ? m.pvW / m.n : NAN, m.n ? m.yieldWh / m.n : NAN,
                  m.n ? m.loadA / m.n : NAN,
@@ -517,17 +704,17 @@ static void publishLive() {
     if (s.n > 0) {
         if (s.nTemp)
             snprintf(buf, sizeof(buf),
-                     "{\"id\":\"sense\",\"src\":\"victron_ble\",\"sn\":\"%s\","
+                     "{\"id\":\"sense\",\"src\":\"victron_ble\",\"sn\":\"YOUR_SENSE_SN\","
                      "\"model\":\"SmartBatterySense\",\"mac\":\"%s\",\"rssi\":%d,"
                      "\"vbat\":%.2f,\"temp\":%.1f,\"n\":%d}",
-                     g_dev[DEV_SENSE].label, g_st[DEV_SENSE].addr, (int)(s.rssi / s.n),
+                     g_st[DEV_SENSE].addr, (int)(s.rssi / s.n),
                      s.vbat / s.n, s.tempC / s.nTemp, s.n);
         else
             snprintf(buf, sizeof(buf),
-                     "{\"id\":\"sense\",\"src\":\"victron_ble\",\"sn\":\"%s\","
+                     "{\"id\":\"sense\",\"src\":\"victron_ble\",\"sn\":\"YOUR_SENSE_SN\","
                      "\"model\":\"SmartBatterySense\",\"mac\":\"%s\",\"rssi\":%d,"
                      "\"vbat\":%.2f,\"n\":%d}",
-                     g_dev[DEV_SENSE].label, g_st[DEV_SENSE].addr, (int)(s.rssi / s.n), s.vbat / s.n, s.n);
+                     g_st[DEV_SENSE].addr, (int)(s.rssi / s.n), s.vbat / s.n, s.n);
         mqtt.publish(TOPIC_SENSE, buf, false);
     }
     accReset(g_acc[0]); accReset(g_acc[1]);
@@ -537,13 +724,15 @@ static void publishStatus() {
     if (millis() - g_lastStatus < LIVE_MS) return;
     g_lastStatus = millis();
     if (!mqtt.connected()) return;
-    char buf[400];
-    snprintf(buf, sizeof(buf),
+    char buf[700];
+    int n = snprintf(buf, sizeof(buf),
              "{\"src\":\"victron_ble\",\"board\":\"feather\",\"mode\":\"%s\","
              "\"mppt_seen\":%s,\"sense_seen\":%s,\"mppt_rssi\":%d,\"sense_rssi\":%d,"
              "\"hits\":%lu,\"dec_ok\":%lu,\"dec_fail\":%lu,"
              "\"clock\":\"%s\",\"today\":%d,\"yday\":%d,\"nvs_today\":%d,\"nvs_yday\":%d,"
-             "\"today_ok\":%s,\"yday_ok\":%s,\"wifi_rssi\":%d,\"vbat\":%.2f,\"ip\":\"%s\",\"uptime\":%lu}",
+             "\"today_ok\":%s,\"yday_ok\":%s,\"wifi_rssi\":%d,\"vbat\":%.2f,\"ip\":\"%s\",\"uptime\":%lu,"
+             "\"heap\":%lu,\"heap_min\":%lu,\"heap_maxblk\":%lu,\"clients\":%u,"
+             "\"conn_fail\":%u,\"rx_ovf\":%lu,\"parse_ovf\":%lu,\"rst\":%d}",
              g_mode == MODE_GATT ? "gatt" : "adv",
              fresh(DEV_MPPT) ? "true" : "false",
              fresh(DEV_SENSE) ? "true" : "false",
@@ -556,32 +745,66 @@ static void publishStatus() {
              g_yday.ok ? "true" : "false",
              WiFi.RSSI(), boardV(),
              WiFi.isConnected() ? WiFi.localIP().toString().c_str() : "",
-             (unsigned long)((millis() - g_bootMs) / 1000));
-    mqtt.publish(TOPIC_STATUS, buf, false);
+             (unsigned long)((millis() - g_bootMs) / 1000),
+             (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(),
+             (unsigned long)ESP.getMaxAllocHeap(),
+             (unsigned)NimBLEDevice::getCreatedClientCount(),
+             (unsigned)g_connFails, (unsigned long)g_rxOvf, (unsigned long)g_parseOvf,
+             (int)esp_reset_reason());
+    if (n > 0 && n < (int)sizeof(buf)) mqtt.publish(TOPIC_STATUS, buf, false);
+    else logf("FAIL status json %d", n);
     led(fresh(DEV_MPPT) || fresh(DEV_SENSE));
 }
 
-static int cborLen(const uint8_t *p, int n) {
-    if (n < 1) return -1;
-    uint8_t t = p[0];
-    if (t <= 0x17) return 1;
-    if (t == 0x18) return n >= 2 ? 2 : -1;
-    if (t == 0x19) return n >= 3 ? 3 : -1;
-    if (t >= 0x40 && t <= 0x57) { int need = 1 + (t - 0x40); return n >= need ? need : -1; }
-    if (t == 0x58) { if (n < 2) return -1; int need = 2 + p[1]; return n >= need ? need : -1; }
-    if (t == 0x41) return n >= 2 ? 2 : -1;
-    if (t == 0x42) return n >= 3 ? 3 : -1;
-    if (t == 0x44) return n >= 5 ? 5 : -1;
-    return 1;
+/* ---- CBOR (RFC 8949) item sizing. Victron VREG-over-BLE frames: op seq 19 HI LO <item> ---- */
+#define CBOR_INCOMPLETE (-1)
+#define CBOR_BAD        (-2)
+/* head: initial byte + argument. returns head length, CBOR_INCOMPLETE or CBOR_BAD. */
+static int cborHead(const uint8_t *p, int n, uint64_t *val) {
+    if (n < 1) return CBOR_INCOMPLETE;
+    uint8_t ai = p[0] & 0x1F;
+    if (ai < 24) { *val = ai; return 1; }
+    int extra = (ai == 24) ? 1 : (ai == 25) ? 2 : (ai == 26) ? 4 : (ai == 27) ? 8 : -1;
+    if (extra < 0) return CBOR_BAD;            /* 28..30 reserved, 31 indefinite — not used here */
+    if (n < 1 + extra) return CBOR_INCOMPLETE;
+    uint64_t v = 0;
+    for (int i = 0; i < extra; i++) v = (v << 8) | p[1 + i];   /* CBOR argument is big-endian */
+    *val = v;
+    return 1 + extra;
 }
+/* total length of one item: ints (major 0/1), byte/text strings (2/3, incl. 0x58/0x59/0x5a),
+ * simple/float (7, incl. f16/f32/f64). arrays/maps/tags (4/5/6): head only. */
+static int cborLen(const uint8_t *p, int n) {
+    uint64_t v = 0;
+    int h = cborHead(p, n, &v);
+    if (h < 0) return h;
+    switch (p[0] >> 5) {
+        case 2: case 3: {
+            if (v > (uint64_t)(PARSE_CAP - 8)) return CBOR_BAD;   /* can never fit → garbage */
+            int need = h + (int)v;
+            return n >= need ? need : CBOR_INCOMPLETE;
+        }
+        default:
+            return h;
+    }
+}
+/* numeric value: CBOR uint / negint, or Victron little-endian byte string of 1/2/4 bytes */
 static bool cborNum(const uint8_t *p, int n, double *out) {
-    if (n < 1) return false;
-    if (p[0] <= 0x17) { *out = p[0]; return true; }
-    if (p[0] == 0x41 && n >= 2) { *out = p[1]; return true; }
-    if (p[0] == 0x42 && n >= 3) { *out = p[1] | (p[2] << 8); return true; }
-    if (p[0] == 0x44 && n >= 5) {
-        *out = (uint32_t)p[1] | ((uint32_t)p[2] << 8) | ((uint32_t)p[3] << 16) | ((uint32_t)p[4] << 24);
-        return true;
+    uint64_t v = 0;
+    int h = cborHead(p, n, &v);
+    if (h < 0) return false;
+    uint8_t mt = p[0] >> 5;
+    if (mt == 0) { *out = (double)v; return true; }
+    if (mt == 1) { *out = -1.0 - (double)v; return true; }
+    if (mt == 2) {
+        if (n < h + (int)v) return false;
+        const uint8_t *b = p + h;
+        if (v == 1) { *out = b[0]; return true; }
+        if (v == 2) { *out = (double)((uint16_t)b[0] | ((uint16_t)b[1] << 8)); return true; }
+        if (v == 4) {
+            *out = (double)((uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24));
+            return true;
+        }
     }
     return false;
 }
@@ -590,24 +813,34 @@ static uint32_t u32le(const uint8_t *p) {
 }
 static uint16_t u16le(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 
-static void recSave(const char *key, const DayRec &r) {
-    prefs.putBytes(key, &r, sizeof(r));
-}
-static void recLoad(const char *key, DayRec &r) {
-    DayRec tmp;
-    if (prefs.getBytes(key, &tmp, sizeof(tmp)) == sizeof(tmp) && tmp.ok)
-        r = tmp;
+static int histDayOfReg(uint16_t reg) {
+    if (reg >= REG_HIST_DAY0 && reg <= REG_HIST_DAY0 + HIST_MAX_DAYS) return reg - REG_HIST_DAY0;
+    return -1;
 }
 
-static void parseDayPage(DayRec &r, const uint8_t *p, int n, int ymd, const char *tag) {
+/* History day record (34 bytes):
+ *  0 version(0; 255=unknown) 1 yield u32 .01kWh 5 consumed u32 9 vbat max u16 .01V 11 vbat min
+ *  13 err db 14..17 errors 18 t bulk 20 t abs 22 t float 24 pmax u32 W 28 ibat max u16 .1A
+ *  30 vpv max u16 .01V 32 day seq u16 */
+static void parseDayPage(int day, const uint8_t *p, int n) {
+    if (day < 0 || day > HIST_MAX_DAYS) return;
+    DayRec &r = g_day[day];
     if (n < 34 || p[0] == 255) {
-        logf("NOTE %s page skip n=%d v=%u", tag, n, n ? (unsigned)p[0] : 0);
+        logf("NOTE day%d page empty n=%d v=%u", day, n, n ? (unsigned)p[0] : 0);
+        if (g_dayState[day] == DAY_PENDING) g_dayState[day] = DAY_EMPTY;
         return;
     }
+#if HIST_DEBUG_FRAMES
+    {
+        char hx[34 * 2 + 1];
+        for (int b = 0; b < 34; b++) snprintf(hx + 2 * b, 3, "%02X", p[b]);
+        logf("PAGE day%d %s", day, hx);
+    }
+#endif
     uint32_t yld = u32le(p + 1);
     uint32_t cns = u32le(p + 5);
     uint32_t pmx = u32le(p + 24);
-    uint16_t vbM = u16le(p + 9), vbm = u16le(p + 11), vpv = u16le(p + 30);
+    uint16_t vbM = u16le(p + 9), vbm = u16le(p + 11), vpv = u16le(p + 30), seq = u16le(p + 32);
     r.yieldKwh = (yld == 0xFFFFFFFFu) ? 0 : yld / 100.0f;
     r.consumedKwh = (cns == 0xFFFFFFFFu) ? 0 : cns / 100.0f;
     r.vbatMax  = (vbM == 0xFFFF) ? 0 : vbM / 100.0f;
@@ -616,11 +849,23 @@ static void parseDayPage(DayRec &r, const uint8_t *p, int n, int ymd, const char
     r.vpvMax   = (vpv == 0xFFFF) ? 0 : vpv / 100.0f;
     r.hasYield = (yld != 0xFFFFFFFFu);
     r.hasPmax  = (pmx != 0xFFFFFFFFu);
+    r.hasSeq   = (seq != 0xFFFF);
+    r.seq      = seq;
+    memcpy(r.err, p + 14, 4);             /* rev8: error 0..3 */
+    r.tBulk    = u16le(p + 18);
+    r.tAbs     = u16le(p + 20);
+    r.tFloat   = u16le(p + 22);
+    r.iBatMax  = u16le(p + 28);           /* rev9: 0.1 A */
+    r.hasPage  = true;
     r.ok = r.hasYield || r.hasPmax;
-    if (ymd) r.ymd = ymd;
-    recSave(tag, r);
-    logf("NVS %s page ymd=%d y=%.2f cons=%.2f pmax=%.0f",
-         tag, r.ymd, (double)r.yieldKwh, (double)r.consumedKwh, (double)r.pmaxW);
+    r.ymd = ymdForDay(g_histBase, day);
+    g_dayState[day] = r.ok ? DAY_OK : DAY_EMPTY;
+    if (r.ok && day >= 1) cacheSave(r);   /* day0 is still open — not cached */
+    logf("RX day%d ymd=%d seq=%u y=%.2f cons=%.2f pmax=%.0f ibat=%.1f bulk=%u abs=%u float=%u err=%u,%u,%u,%u",
+         day, r.ymd, (unsigned)seq, (double)r.yieldKwh, (double)r.consumedKwh, (double)r.pmaxW,
+         r.iBatMax == 0xFFFF ? -1.0 : r.iBatMax / 10.0,
+         (unsigned)r.tBulk, (unsigned)r.tAbs, (unsigned)r.tFloat,
+         (unsigned)r.err[0], (unsigned)r.err[1], (unsigned)r.err[2], (unsigned)r.err[3]);
 }
 
 static void parseFrames() {
@@ -635,48 +880,101 @@ static void parseFrames() {
         if (g_parse[i + 2] != 0x19) { i++; continue; }
         uint16_t reg = ((uint16_t)g_parse[i + 3] << 8) | g_parse[i + 4];
         int cl = cborLen(g_parse + i + 5, g_parseLen - (i + 5));
-        if (cl < 0) break;
+        if (cl == CBOR_INCOMPLETE) break;          /* wait for the next notification */
+        if (cl == CBOR_BAD) { i++; continue; }     /* resync */
         const uint8_t *pay = g_parse + i + 5;
-        if (op == 0x08 && (reg == REG_TODAY || reg == REG_YDAY)) {
-            DayRec &slot = (reg == REG_TODAY) ? g_today : g_yday;
-            const char *tag = (reg == REG_TODAY) ? "today" : "yday";
-            int ymd = (reg == REG_TODAY) ? todayYmd() : yesterdayYmd();
-            if (pay[0] == 0x58 && cl >= 2) parseDayPage(slot, pay + 2, pay[1], ymd, tag);
-            else if (cl >= 34) parseDayPage(slot, pay, cl, ymd, tag);
+        bool live = (g_parse[i + 1] == 0x03 && op == 0x08 && histDayOfReg(reg) < 0 &&
+                     (reg < REG_HIST_MPPT0 || reg > REG_HIST_MPPT0 + HIST_MAX_DAYS));
+        if (!live) g_lastReplyMs = millis();   /* live stream must not block pacing */
+#if HIST_DEBUG_FRAMES
+        if (g_mode == MODE_GATT && (HIST_DEBUG_FRAMES == 1 || !live)) {
+            /* FRM op seq reg len +ms | first payload bytes. seq = byte after op (compare with TX seq) */
+            char hx[3 * 12 + 1]; int k = 0;
+            for (int b = 0; b < cl && b < 12; b++) k += snprintf(hx + k, sizeof(hx) - k, "%02X ", pay[b]);
+            hx[k] = 0;
+            logf("FRM %02X s=%02X reg=0x%04X cl=%d +%lums | %s", (unsigned)op, (unsigned)g_parse[i + 1],
+                 (unsigned)reg, cl, (unsigned long)(millis() - g_gattStartMs), hx);
         }
-        if (op == 0x08) {
+#endif
+        int hd = histDayOfReg(reg);
+        if (g_job == JOB_HIST && hd >= 0 && hd <= g_histN && op == 0x08 &&
+            g_dayState[hd] != DAY_PENDING) {
+            /* duplicate / late reply for a day that is already closed (each request goes to
+             * 0003 and 0004, retries add more) — do not re-parse */
+            logf("DUP day%d reg=0x%04X ignored (state=%u)", hd, (unsigned)reg, (unsigned)g_dayState[hd]);
+            hd = -1;
+        }
+        if (g_job == JOB_HIST && hd >= 0 && hd <= g_histN) {
+            uint64_t blen = 0;
+            int h = cborHead(pay, cl, &blen);
+            if (hd != g_histDay && op == 0x08)
+                logf("NOTE reply for day%d while waiting day%d (accepted by reg id)", hd, g_histDay);
+            if (op == 0x09) {
+                /* 0x09 = error/status reply. value looks like VE.Direct HEX flags (guess):
+                 * 0x01 unknown id, 0x02 not supported, 0x04 parameter error / empty history record.
+                 * 0x04 closes the day as empty; 01/02 make histTick move to the next request form now. */
+                uint8_t fl = (pay[0] <= 0x17) ? pay[0] : 0xFF;
+                logf("RX day%d err 09 s=%02X flag=0x%02X", hd, (unsigned)g_parse[i + 1], (unsigned)fl);
+                if (g_dayState[hd] == DAY_PENDING) {
+                    if (fl == 0x04) g_dayState[hd] = DAY_EMPTY;
+                    else g_dayErr[hd] = fl ? fl : 0xFF;
+                }
+            } else if ((pay[0] >> 5) == 2 && h > 0) {
+                parseDayPage(hd, pay + h, (int)blen);
+            } else if (g_dayState[hd] == DAY_PENDING) {
+                /* 0x09 is ACK, not a missing page. only 0x08 non-page can mark empty. */
+                logf("NOTE day%d op=%02X non-page reply t=%02X", hd, (unsigned)op, (unsigned)pay[0]);
+                g_dayState[hd] = DAY_EMPTY;
+            }
+        }
+        if (g_job == JOB_PV && g_pvPhase < PV_NREGS && reg == PV_REGS[g_pvPhase] && op == 0x09 && g_pvTry) {
+            uint8_t fl = (pay[0] <= 0x17) ? pay[0] : 0xFF;
+            logf("RX pv reg=0x%04X err 09 s=%02X flag=0x%02X", (unsigned)reg, (unsigned)g_parse[i + 1], (unsigned)fl);
+            if (!g_pvErr) g_pvErr = fl ? fl : 0xFF;
+        }
+        bool pvDup = false;
+        if (g_job == JOB_PV && op == 0x08 &&
+            ((reg == REG_PV_V && g_havePvV) || (reg == REG_PV_W && g_havePvW) || (reg == REG_PV_A && g_havePvA))) {
+            /* rev6: duplicate / stale reply for a pv reg we already have — ignore, do not advance */
+            if (!live) logf("DUP pv reg=0x%04X s=%02X ignored +%lums", (unsigned)reg, (unsigned)g_parse[i + 1],
+                            (unsigned long)(millis() - g_gattStartMs));   /* live s=03 repeats: silent */
+            pvDup = true;
+        }
+        if (op == 0x08 && !pvDup) {
             double num = NAN;
             if (cborNum(pay, cl, &num)) {
                 if (reg == REG_PV_V) { g_pvV = (float)(num * 0.01); g_havePvV = true; }
                 if (reg == REG_PV_W) { g_pvWatt = (float)(num * 0.01); g_havePvW = true; }
                 if (reg == REG_PV_A) { g_pvA = (float)(num * 0.1); g_havePvA = true; }
-                if (reg == REG_EDD1) {
-                    g_yday.yieldKwh = (float)(num * 0.01);
-                    g_yday.hasYield = g_yday.ok = true;
-                    if (yesterdayYmd()) g_yday.ymd = yesterdayYmd();
-                    recSave("yday", g_yday);
-                    logf("NVS yday EDD1 ymd=%d y=%.2f", g_yday.ymd, (double)g_yday.yieldKwh);
-                }
-                if (reg == REG_EDD0) {
-                    g_yday.pmaxW = (float)num;
-                    g_yday.hasPmax = g_yday.ok = true;
-                    if (yesterdayYmd()) g_yday.ymd = yesterdayYmd();
-                    recSave("yday", g_yday);
-                    logf("NVS yday EDD0 ymd=%d pmax=%.0f", g_yday.ymd, (double)g_yday.pmaxW);
-                }
-                if (reg == REG_EDD3) {
-                    g_today.yieldKwh = (float)(num * 0.01);
-                    g_today.hasYield = g_today.ok = true;
-                    if (todayYmd()) g_today.ymd = todayYmd();
-                    recSave("today", g_today);
-                    logf("NVS today EDD3 ymd=%d y=%.2f", g_today.ymd, (double)g_today.yieldKwh);
-                }
-                if (reg == REG_EDD2) {
-                    g_today.pmaxW = (float)num;
-                    g_today.hasPmax = g_today.ok = true;
-                    if (todayYmd()) g_today.ymd = todayYmd();
-                    recSave("today", g_today);
-                    logf("NVS today EDD2 ymd=%d pmax=%.0f", g_today.ymd, (double)g_today.pmaxW);
+                if (g_job == JOB_PV && (reg == REG_PV_V || reg == REG_PV_W || reg == REG_PV_A))
+                    logf("RX pv reg=0x%04X s=%02X raw=%.0f +%lums", (unsigned)reg, (unsigned)g_parse[i + 1],
+                         num, (unsigned long)(millis() - g_gattStartMs));   /* rev10: where the value came from */
+                if (g_job == JOB_HIST) {
+                    /* EDDx fallback only fills fields the day page did not deliver */
+                    if (reg == REG_EDD1 && g_histN >= 1 && !g_yday.hasYield) {
+                        g_yday.yieldKwh = (float)(num * 0.01);
+                        g_yday.hasYield = g_yday.ok = true;
+                        g_yday.ymd = ymdForDay(g_histBase, 1);
+                        logf("RX yday EDD1 ymd=%d y=%.2f", g_yday.ymd, (double)g_yday.yieldKwh);
+                    }
+                    if (reg == REG_EDD0 && g_histN >= 1 && !g_yday.hasPmax) {
+                        g_yday.pmaxW = (float)num;
+                        g_yday.hasPmax = g_yday.ok = true;
+                        g_yday.ymd = ymdForDay(g_histBase, 1);
+                        logf("RX yday EDD0 ymd=%d pmax=%.0f", g_yday.ymd, (double)g_yday.pmaxW);
+                    }
+                    if (reg == REG_EDD3 && !g_today.hasYield) {
+                        g_today.yieldKwh = (float)(num * 0.01);
+                        g_today.hasYield = g_today.ok = true;
+                        g_today.ymd = ymdForDay(g_histBase, 0);
+                        logf("RX today EDD3 ymd=%d y=%.2f", g_today.ymd, (double)g_today.yieldKwh);
+                    }
+                    if (reg == REG_EDD2 && !g_today.hasPmax) {
+                        g_today.pmaxW = (float)num;
+                        g_today.hasPmax = g_today.ok = true;
+                        g_today.ymd = ymdForDay(g_histBase, 0);
+                        logf("RX today EDD2 ymd=%d pmax=%.0f", g_today.ymd, (double)g_today.pmaxW);
+                    }
                 }
             }
         }
@@ -688,45 +986,55 @@ static void parseFrames() {
         g_parseLen = left;
     }
 }
+static void rxReset() {
+    portENTER_CRITICAL(&g_rxMux);
+    g_rxLen = 0;
+    portEXIT_CRITICAL(&g_rxMux);
+    g_parseLen = 0;
+}
 static void drainRx() {
-    noInterrupts();
+    portENTER_CRITICAL(&g_rxMux);
     uint16_t n = g_rxLen;
     if (n) {
-        if (g_parseLen + n > sizeof(g_parse)) g_parseLen = 0;
-        if (g_parseLen + n <= sizeof(g_parse)) {
-            memcpy(g_parse + g_parseLen, g_rx, n);
-            g_parseLen += n;
-        }
-        g_rxLen = 0;
+        uint16_t space = PARSE_CAP - g_parseLen;
+        if (n > space) n = space;              /* rest stays in g_rx for the next pass */
+        memcpy(g_parse + g_parseLen, g_rx, n);
+        g_parseLen += n;
+        if (n < g_rxLen) memmove(g_rx, g_rx + n, g_rxLen - n);
+        g_rxLen -= n;
     }
-    interrupts();
+    portEXIT_CRITICAL(&g_rxMux);
+    if (n) g_lastRxMs = millis();
     if (g_parseLen) parseFrames();
+    if (g_parseLen >= PARSE_CAP) {             /* full and nothing consumable → drop 1 byte, resync */
+        memmove(g_parse, g_parse + 1, --g_parseLen);
+        g_parseOvf++;
+    }
 }
-static void onNotify(NimBLERemoteCharacteristic *, uint8_t *data, size_t len, bool) {
+static void onNotify(NimBLERemoteCharacteristic *ch, uint8_t *data, size_t len, bool) {
     if (!data || !len) return;
     g_sawNotify = true;
-    noInterrupts();
-    if (g_rxLen + len <= sizeof(g_rx)) {
+    int ci = (ch == g_chCtrl) ? 0 : (ch == g_chCmd) ? 1 : (ch == g_chBulk) ? 2 : -1;
+    portENTER_CRITICAL(&g_rxMux);
+    if (ci >= 0) g_rxBytesCh[ci] += len;
+    if ((size_t)g_rxLen + len <= RX_CAP) {
         memcpy(g_rx + g_rxLen, data, len);
         g_rxLen += (uint16_t)len;
-    } else g_rxLen = 0;
-    interrupts();
+    } else {
+        g_rxOvf++;                             /* keep what we have, drop this chunk */
+    }
+    portEXIT_CRITICAL(&g_rxMux);
 }
 
 class ClientCB : public NimBLEClientCallbacks {
     void onConnect(NimBLEClient *) override {
         logln("STEP onConnect");
     }
-    void onDisconnect(NimBLEClient *, int reason) override {
-        logf("STEP drop 0x%02x -> ADV", reason);
-        if (g_job == JOB_HIST && (g_today.ok || g_yday.ok))
-            g_histPubPending = true;
-        g_wantHist = false;
-        g_mode = MODE_ADV;
-        g_job = JOB_NONE;
-        g_cli = nullptr;
-        g_chCtrl = g_chCmd = g_chBulk = nullptr;
-        bleScanStart();
+    /* host task: only flag. cleanup (deleteClient, scan restart, publish) happens in loop(). */
+    void onDisconnect(NimBLEClient *c, int reason) override {
+        g_dropReason = reason;
+        g_dropCli = c;
+        g_peerDrop = true;
     }
     void onPassKeyEntry(NimBLEConnInfo &info) override {
         logln("STEP passkey inject");
@@ -754,35 +1062,60 @@ static bool wrHex(NimBLERemoteCharacteristic *ch, const char *hex) {
 /* Handshake GET that worked on this MPPT: 05 seq 82 19 REG [19 REG ...]
  * lone 05 seq 81 19 REG was ignored (no 08 and no 09). */
 static bool wrBoth(const uint8_t *pkt, int n) {
+    if (g_mode == MODE_GATT && g_job == JOB_HIST) {
+        char hx[3 * 24 + 1]; int k = 0;
+        for (int b = 0; b < n && b < 24; b++) k += snprintf(hx + k, sizeof(hx) - k, "%02X ", pkt[b]);
+        hx[k] = 0;
+        logf("TXHEX m=%u n=%d +%lums | %s", (unsigned)g_wrMask, n,
+             (unsigned long)(millis() - g_gattStartMs), hx);
+    }
     bool ok = false;
-    if (g_chCmd) ok = g_chCmd->writeValue(pkt, n, false);
-    if (g_chBulk) g_chBulk->writeValue(pkt, n, false);
+    if (g_chCmd && (g_wrMask & 1)) ok = g_chCmd->writeValue(pkt, n, false);
+    if (g_chBulk && (g_wrMask & 2)) {
+        bool ok2 = g_chBulk->writeValue(pkt, n, false);
+        if (!(g_wrMask & 1)) ok = ok2;
+    }
     return ok;
 }
-/* 05 seq flag 19 REG [19 REG ...] */
-static bool getRegs(const uint16_t *regs, int n, uint8_t flag) {
-    if (n <= 0) return false;
-    uint8_t pkt[48];
+/* 05 seq 8n 19 REG [19 REG ...]
+ * The byte after seq looks like a CBOR array head (0x81 = 1 item, 0x82 = 2 items; same in the
+ * captured init strings), so it is derived from n here. The original code sent 0x82 with 4
+ * regs → device would only see the first 2. seq is kept 1..23 so it stays a 1-byte CBOR uint
+ * (0x18+ would be read as "uint8 follows"). Refuse instead of silently truncating. */
+static bool getRegs(const uint16_t *regs, int n, uint8_t flagHint) {
+    uint8_t pkt[3 + 3 * MAX_GET_REGS];
+    if (n <= 0 || n > MAX_GET_REGS) { logf("FAIL getRegs n=%d (max %d)", n, MAX_GET_REGS); return false; }
+    uint8_t flag = (uint8_t)(0x80 | n);       /* CBOR array(n), n <= 23 */
+    if (flagHint && flagHint != flag) logf("NOTE getRegs flag 0x%02X -> 0x%02X (n=%d)", flagHint, flag, n);
     int i = 0;
     pkt[i++] = 0x05;
+    if (g_seqFixed >= 0) {
+        pkt[i++] = (uint8_t)g_seqFixed;     /* rev10: pv uses PV_SEQ, running counter untouched */
+        pkt[i++] = flag;
+    } else {
     pkt[i++] = g_seq;
     pkt[i++] = flag;
-    g_seq = (uint8_t)(g_seq + 1); if (!g_seq) g_seq = 1;
-    for (int k = 0; k < n && i + 3 <= (int)sizeof(pkt); k++) {
+    do { g_seq = (uint8_t)(g_seq % 0x17 + 1); } while (g_seq == 0x03);  /* 1..23, never 03 (live stream id) */
+    }
+    for (int k = 0; k < n; k++) {
         pkt[i++] = 0x19;
         pkt[i++] = (uint8_t)(regs[k] >> 8);
         pkt[i++] = (uint8_t)regs[k];
     }
     bool ok = wrBoth(pkt, i);
-    logf("TX get flag=0x%02X n=%d first=0x%04X ok=%d",
-         (unsigned)flag, n, regs[0], (int)ok);
+    g_lastTxSeq = pkt[1];
+    g_lastTxMs = millis();
+    logf("TX get s=%02X flag=0x%02X n=%d first=0x%04X ok=%d +%lums",
+         (unsigned)pkt[1], (unsigned)flag, n, regs[0], (int)ok,
+         (unsigned long)(g_mode == MODE_GATT ? millis() - g_gattStartMs : 0));
     return ok;
 }
 /* Mac working hist: concat 05 03 81 19 HI LO per reg, write 0003+0004 */
 static bool getRegs81Concat(const uint16_t *regs, int n) {
-    uint8_t pkt[64];
+    uint8_t pkt[6 * MAX_GET_REGS];
+    if (n <= 0 || n > MAX_GET_REGS) { logf("FAIL hist81 n=%d (max %d)", n, MAX_GET_REGS); return false; }
     int i = 0;
-    for (int k = 0; k < n && i + 6 <= (int)sizeof(pkt); k++) {
+    for (int k = 0; k < n; k++) {
         pkt[i++] = 0x05;
         pkt[i++] = 0x03;
         pkt[i++] = 0x81;
@@ -791,17 +1124,28 @@ static bool getRegs81Concat(const uint16_t *regs, int n) {
         pkt[i++] = (uint8_t)regs[k];
     }
     bool ok = wrBoth(pkt, i);
-    logf("TX hist81-concat n=%d bytes=%d ok=%d", n, i, (int)ok);
+    g_lastTxMs = millis();
+    logf("TX hist81-concat s=03 n=%d first=0x%04X bytes=%d ok=%d +%lums", n, regs[0], i, (int)ok,
+         (unsigned long)(g_mode == MODE_GATT ? millis() - g_gattStartMs : 0));
     return ok;
 }
 static bool getReg(uint16_t reg) {
-    uint8_t pkt[6] = { 0x05, 0x00, 0x81, 0x19, (uint8_t)(reg >> 8), (uint8_t)reg };
-    return wrBoth(pkt, 6);
+    uint16_t one = reg;
+    return getRegs(&one, 1, 0);   /* 05 seq 81 19 REG, seq 1..23 — lone seq=0 81 was ignored */
+}
+
+/* rev10: pv get with the fixed PV_SEQ */
+static bool pvGetReg(uint16_t reg) {
+    g_seqFixed = PV_SEQ;
+    bool ok = getReg(reg);
+    g_seqFixed = -1;
+    return ok;
 }
 
 static void gattDrop() {
     if (g_cli) {
-        if (g_cli->isConnected()) g_cli->disconnect();
+        /* connected: deleteClient disconnects and deletes on the disconnect event.
+         * already dropped by peer: deleted right here (this is what fixes the client leak). */
         NimBLEDevice::deleteClient(g_cli);
         g_cli = nullptr;
     }
@@ -812,45 +1156,141 @@ static void gattDrop() {
     bleScanStart();
     logln("STEP back_to_adv");
 }
-
-static void pubDay(const DayRec &r, const char *kind, int day) {
-    if (!r.ok || !mqtt.connected()) return;
-    int want = (day == 0) ? todayYmd() : yesterdayYmd();
-    char js[300];
-    snprintf(js, sizeof(js),
-             "{\"id\":\"mppt\",\"sn\":\"%s\",\"src\":\"%s\","
-             "\"kind\":\"%s\",\"day\":%d,\"ymd\":%d,"
-             "\"yield_kwh\":%.2f,\"consumed_kwh\":%.2f,\"pmax_w\":%.0f,\"vpv_max\":%.2f,"
-             "\"vbat_max\":%.2f,\"vbat_min\":%.2f}",
-             g_dev[DEV_MPPT].label,
-             (r.ymd && want && r.ymd == want) ? "nvs" : "gatt",
-             kind, day, r.ymd,
-             (double)r.yieldKwh, (double)r.consumedKwh, (double)r.pmaxW, (double)r.vpvMax,
-             (double)r.vbatMax, (double)r.vbatMin);
-    mqtt.publish(TOPIC_HIST, js, false);
-    logf("PUB hist %s day=%d ymd=%d y=%.2f pmax=%.0f",
-         kind, day, r.ymd, (double)r.yieldKwh, (double)r.pmaxW);
+static void cleanupStaleClients() {
+    for (int k = 0; k < 4; k++) {
+        NimBLEClient *old = NimBLEDevice::getDisconnectedClient();
+        if (!old) break;
+        logln("STEP delete stale client");
+        if (!NimBLEDevice::deleteClient(old)) break;
+    }
 }
-static void pubYday() { pubDay(g_yday, "yesterday", 1); }
+
+static void pubDay(const DayRec &r, int day, const char *src) {
+    if (!r.ok || !mqtt.connected()) return;
+    const char *kind = (day == 0) ? "today" : (day == 1) ? "yesterday" : "day";
+    char seq[8];
+    if (r.hasSeq) snprintf(seq, sizeof(seq), "%u", (unsigned)r.seq);
+    else snprintf(seq, sizeof(seq), "null");
+    /* rev8: charge-stage minutes + error 0..3 from the page (null for EDDx-only / unknown 0xFFFF) */
+    char tb[8], ta[8], tf[8], er[24];
+    const uint16_t tv[3] = { r.tBulk, r.tAbs, r.tFloat };
+    char *to[3] = { tb, ta, tf };
+    for (int t = 0; t < 3; t++) {
+        if (r.hasPage && tv[t] != 0xFFFF) snprintf(to[t], 8, "%u", (unsigned)tv[t]);
+        else snprintf(to[t], 8, "null");
+    }
+    if (r.hasPage) snprintf(er, sizeof(er), "[%u,%u,%u,%u]",
+                            (unsigned)r.err[0], (unsigned)r.err[1], (unsigned)r.err[2], (unsigned)r.err[3]);
+    else snprintf(er, sizeof(er), "null");
+    char ib[12];                          /* rev9: ibat_max A, 1 decimal */
+    if (r.hasPage && r.iBatMax != 0xFFFF) snprintf(ib, sizeof(ib), "%.1f", r.iBatMax / 10.0);
+    else snprintf(ib, sizeof(ib), "null");
+    char js[480];
+    int n = snprintf(js, sizeof(js),
+             "{\"id\":\"mppt\",\"sn\":\"YOUR_MPPT_SN\",\"src\":\"%s\","
+             "\"kind\":\"%s\",\"day\":%d,\"ymd\":%d,\"seq\":%s,"
+             "\"yield_kwh\":%.2f,\"consumed_kwh\":%.2f,\"pmax_w\":%.0f,\"vpv_max\":%.2f,"
+             "\"vbat_max\":%.2f,\"vbat_min\":%.2f,\"ibat_max\":%s,"
+             "\"bulk_min\":%s,\"abs_min\":%s,\"float_min\":%s,\"err\":%s}",
+             src, kind, day, r.ymd, seq,
+             (double)r.yieldKwh, (double)r.consumedKwh, (double)r.pmaxW, (double)r.vpvMax,
+             (double)r.vbatMax, (double)r.vbatMin, ib, tb, ta, tf, er);
+    if (n <= 0 || n >= (int)sizeof(js)) { logf("FAIL hist json day=%d n=%d", day, n); return; }
+    bool ok = mqtt.publish(TOPIC_HIST, js, false);
+    logf("PUB hist %s day=%d ymd=%d y=%.2f pmax=%.0f ok=%d",
+         kind, day, r.ymd, (double)r.yieldKwh, (double)r.pmaxW, (int)ok);
+}
+static void pubHistAll() {
+    for (int d = 0; d <= g_histN && d <= HIST_MAX_DAYS; d++) {
+        if (!g_day[d].ok || g_dayPub[d]) continue;
+        if (g_dayState[d] == DAY_PENDING) continue;   /* EDDx partial for a day still being read */
+        pubDay(g_day[d], d, g_dayState[d] == DAY_CACHED ? "nvs" : "gatt");
+        g_dayPub[d] = true;
+        mqtt.loop();
+    }
+}
 static void pubPv() {
     char vs[16], ws[16], as[16], js[220];
     jsonNum(vs, sizeof(vs), g_havePvV, g_pvV, 2);
     jsonNum(ws, sizeof(ws), g_havePvW, g_pvWatt, 2);
-    jsonNum(as, sizeof(as), g_havePvA, g_pvA, 2);
+    /* rev7: no EDBD reply → ipv = ppv / vpv (vpv > 1 V), 0 if ppv == 0 at low/invalid vpv, else null */
+    bool haveA = g_havePvA && !isnan(g_pvA);
+    float ipv = g_pvA;
+    bool calc = false;
+    bool vOk = g_havePvV && !isnan(g_pvV), wOk = g_havePvW && !isnan(g_pvWatt);
+    if (!haveA && wOk) {
+        if (vOk && g_pvV > 1.0f) { ipv = roundf(g_pvWatt / g_pvV * 100.0f) / 100.0f; haveA = calc = true; }
+        else if (g_pvWatt == 0.0f) { ipv = 0.0f; haveA = calc = true; }
+    }
+    jsonNum(as, sizeof(as), haveA, ipv, 2);
     snprintf(js, sizeof(js),
-             "{\"id\":\"mppt\",\"sn\":\"%s\",\"src\":\"gatt\","
-             "\"vpv\":%s,\"ppv\":%s,\"ipv\":%s}",
-             g_dev[DEV_MPPT].label, vs, ws, as);
+             "{\"id\":\"mppt\",\"sn\":\"YOUR_MPPT_SN\",\"src\":\"gatt\","
+             "\"vpv\":%s,\"ppv\":%s,\"ipv\":%s%s}",
+             vs, ws, as, calc ? ",\"ipv_calc\":true" : "");
     if (mqtt.connected()) mqtt.publish(TOPIC_PV, js, false);
     logf("PUB pv %s", js);
 }
 
-static void histFinish() {
+static void histSeqCheck() {
+    if (!g_today.ok || !g_today.hasSeq) return;
+    for (int d = 1; d <= g_histN; d++) {
+        const DayRec &r = g_day[d];
+        if (!r.ok || !r.hasSeq || g_dayState[d] == DAY_CACHED) continue;
+        int want = ((int)g_today.seq - d) % 365;
+        if (want < 0) want += 365;
+        if (r.seq != want)
+            logf("WARN day%d seq=%u expected %d (device day boundary != calendar?)", d, (unsigned)r.seq, want);
+    }
+}
+static int histPendingCount() {
+    int n = 0;
+    for (int d = 0; d <= g_histN; d++) if (g_dayState[d] == DAY_PENDING) n++;
+    return n;
+}
+/* end of one GATT session. resume=true: disconnect and reconnect later for the remaining days */
+static void histSessionEnd(bool resume) {
+    int pend = histPendingCount();
+    if (resume && pend > 0 && g_histSessions < HIST_MAX_SESSIONS) {
+        logf("STEP hist session %u end: closed=%u pending=%d ms=%lu rx02=%lu rx03=%lu rx04=%lu — resume",
+             (unsigned)g_histSessions, (unsigned)g_histSessDays, pend,
+             (unsigned long)(millis() - g_gattStartMs),
+             (unsigned long)g_rxBytesCh[0], (unsigned long)g_rxBytesCh[1], (unsigned long)g_rxBytesCh[2]);
+        if (g_histSessDays) g_connFails = 0;
+        gattDrop();
+        pubHistAll();                       /* publish what we have so far */
+        g_histCont = true;
+        g_wantHist = true;                  /* maybeGatt reconnects after HIST_RECONNECT_MS */
+        return;
+    }
+    /* job end: anything still pending is a failure */
+    for (int d = 0; d <= g_histN; d++) if (g_dayState[d] == DAY_PENDING) g_dayState[d] = DAY_FAIL;
+    g_histCont = false;
     g_wantHist = false;
-    gattDrop();
-    if (g_today.ok) pubDay(g_today, "today", 0);
-    if (g_yday.ok) pubDay(g_yday, "yesterday", 1);
-    if (!g_today.ok && !g_yday.ok) logln("NOTE hist empty");
+    int ok = 0, empty = 0, fail = 0, cached = 0;
+    for (int d = 0; d <= g_histN; d++) {
+        if (g_dayState[d] == DAY_OK) ok++;
+        else if (g_dayState[d] == DAY_EMPTY) empty++;
+        else if (g_dayState[d] == DAY_FAIL) fail++;
+        else if (g_dayState[d] == DAY_CACHED) cached++;
+    }
+    logf("STEP hist done N=%d ok=%d cached=%d empty=%d fail=%d sessions=%u ms=%lu rx02=%lu rx03=%lu rx04=%lu",
+         g_histN, ok, cached, empty, fail, (unsigned)g_histSessions,
+         (unsigned long)(millis() - g_gattStartMs),
+         (unsigned long)g_rxBytesCh[0], (unsigned long)g_rxBytesCh[1], (unsigned long)g_rxBytesCh[2]);
+    histSeqCheck();
+    if (g_mode == MODE_GATT) gattDrop();
+    if (ok || g_today.ok || g_yday.ok) g_connFails = 0;
+    pubHistAll();
+    if (!ok && !cached && !g_today.ok && !g_yday.ok) logln("NOTE hist empty");
+}
+static void histFinish() { histSessionEnd(false); }
+
+static bool gattFail(NimBLEClient *c, const char *why) {
+    logln(why);
+    if (c) NimBLEDevice::deleteClient(c);   /* disconnects first if needed */
+    if (g_connFails < 255) g_connFails++;
+    bleScanStart();
+    return false;
 }
 
 static bool gattBurst(int job) {
@@ -862,60 +1302,47 @@ static bool gattBurst(int job) {
     logf("STEP gatt_connect %s type=%u rssi=%d age=%lu job=%d",
          m.addr, (unsigned)m.addrType, m.rssi,
          (unsigned long)(millis() - m.lastMs), job);
-    NimBLEScan *sc = NimBLEDevice::getScan();
-    bool scanOn = sc && sc->isScanning();
-    logf("STEP scanOn=%d clients=%d",
-         (int)scanOn, (int)NimBLEDevice::getCreatedClientCount());
-    NimBLEAddress peer(m.addr, m.addrType);
+    cleanupStaleClients();
+    logf("STEP clients=%d heap=%lu maxblk=%lu",
+         (int)NimBLEDevice::getCreatedClientCount(),
+         (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
     NimBLEClient *c = NimBLEDevice::createClient();
-    if (!c) { logln("FAIL createClient"); return false; }
+    if (!c) {
+        logln("FAIL createClient — host reset");
+        g_connFails = CONN_FAIL_RESET;      /* force recovery in maybeGatt */
+        return false;
+    }
     c->setClientCallbacks(&g_clientCb, false);
     c->setConnectTimeout(8000);
-    const NimBLEAdvertisedDevice *ad = nullptr;
-    if (sc) {
-        NimBLEScanResults rs = sc->getResults();
-        for (int i = 0; i < rs.getCount(); i++) {
-            const NimBLEAdvertisedDevice *d = rs.getDevice(i);
-            if (d && String(d->getAddress().toString().c_str()) == String(m.addr)) {
-                ad = d; break;
-            }
-        }
-    }
-    String aStr = ad ? String(ad->getAddress().toString().c_str()) : String(m.addr);
-    uint8_t aType = ad ? ad->getAddress().getType() : m.addrType;
+    /* address/type come from our own ADV decode — no scan-results lookup
+     * (results are no longer stored, and reading them while scanning races the host task) */
     bleScanStop();
     delay(80);
-    NimBLEAddress use(aStr.c_str(), aType);
+    NimBLEAddress use(std::string(m.addr), m.addrType);
     logf("STEP peer %s type=%u", use.toString().c_str(), (unsigned)use.getType());
+    g_peerDrop = false;
     uint32_t tConn = millis();
     bool linked = c->connect(use, true, false, true);
     uint32_t cms = millis() - tConn;
     logf("STEP connect()=%d ms=%lu", (int)linked, (unsigned long)cms);
-    if (!linked) {
-        logln("FAIL connect");
-        NimBLEDevice::deleteClient(c);
-        bleScanStart();
-        return false;
-    }
+    if (!linked) return gattFail(c, "FAIL connect");
     g_enc = false;
     c->secureConnection(true);
     uint32_t t0 = millis();
-    while (!g_enc && millis() - t0 < 5000) { delay(40); mqtt.loop(); }
+    while (!g_enc && millis() - t0 < 5000 && c->isConnected()) { delay(40); mqtt.loop(); }
     logf("STEP enc=%d", (int)g_enc);
-    if (!c->discoverAttributes()) {
-        logln("FAIL discover");
-        c->disconnect(); NimBLEDevice::deleteClient(c); bleScanStart();
-        return false;
-    }
+    if (!c->isConnected()) return gattFail(c, "FAIL dropped during auth");
+    if (!c->discoverAttributes()) return gattFail(c, "FAIL discover");
     NimBLERemoteService *svc = c->getService(SVC_APP);
-    if (!svc) {
-        logln("FAIL no_306b");
-        c->disconnect(); NimBLEDevice::deleteClient(c); bleScanStart();
-        return false;
-    }
+    if (!svc) return gattFail(c, "FAIL no_306b");
     g_chCtrl = svc->getCharacteristic(CHR_2);
     g_chCmd  = svc->getCharacteristic(CHR_3);
     g_chBulk = svc->getCharacteristic(CHR_4);
+    if (job == JOB_PV) {                  /* rev10: clear before subscribe — "already received" = this connection only */
+        g_havePvV = g_havePvW = g_havePvA = false;
+        g_pvV = g_pvWatt = g_pvA = NAN;
+    }
+    rxReset();
     if (g_chCtrl && g_chCtrl->canNotify()) g_chCtrl->subscribe(true, onNotify);
     if (g_chCmd && g_chCmd->canNotify()) g_chCmd->subscribe(true, onNotify);
     if (g_chBulk && g_chBulk->canNotify()) g_chBulk->subscribe(true, onNotify);
@@ -924,9 +1351,45 @@ static bool gattBurst(int job) {
     g_job = job;
     g_gattStartMs = millis();
     g_sawNotify = false;
-    g_rxLen = g_parseLen = 0;
-    g_histPhase = 0;
     g_pvPhase = 0;
+    g_pvFbSent = false;
+    g_pvTry = 0;
+    g_pvErr = 0;
+    g_pvEdbcWait = g_pvEdbcDone = false;
+    g_wrMask = 3;
+    if (job == JOB_HIST) {
+        portENTER_CRITICAL(&g_rxMux);
+        memset(g_rxBytesCh, 0, sizeof(g_rxBytesCh));
+        portEXIT_CRITICAL(&g_rxMux);
+        g_lastRxMs = g_lastTxMs = g_lastReplyMs = millis();
+        int pending = 0;
+        if (!g_histCont) {
+            /* new hist job: per-day slots, ymd from job start. closed days in NVS are not re-read. */
+            g_histBase = time(nullptr);
+            memset(g_day, 0, sizeof(g_day));
+            memset(g_dayState, 0, sizeof(g_dayState));
+            memset(g_dayErr, 0, sizeof(g_dayErr));
+            memset(g_dayTries, 0, sizeof(g_dayTries));
+            memset(g_dayPub, 0, sizeof(g_dayPub));
+            for (int d = g_histN + 1; d <= HIST_MAX_DAYS; d++) g_dayState[d] = DAY_SKIP;
+            for (int d = 0; d <= g_histN; d++)
+                if (d >= 1 && cacheLoad(ymdForDay(g_histBase, d), g_day[d])) g_dayState[d] = DAY_CACHED;
+            g_histSessions = 0;
+            g_histEmptyRun = 0;
+            g_histFbSent = false;
+        }
+        for (int d = 0; d <= g_histN; d++) if (g_dayState[d] == DAY_PENDING) pending++;
+        g_histSessions++;
+        g_histSessDays = 0;
+        g_histSessStop = false;
+        g_histDay = -1;
+        g_histTry = 0;
+        g_histNeedSend = false;
+        g_histBudgetMs = HIST_SESSION_END_MS;
+        logf("STEP hist %s day0..%d pending=%d session=%u/%u",
+             g_histCont ? "resume" : "plan", g_histN, pending,
+             (unsigned)g_histSessions, (unsigned)HIST_MAX_SESSIONS);
+    }
     wrHex(g_chCtrl, "fa80ff"); delay(100);
     wrHex(g_chCtrl, "f980");   delay(100);
     wrHex(g_chCmd,  "01");     delay(80);
@@ -936,19 +1399,20 @@ static bool gattBurst(int job) {
     /* Mac vereg extra init — without these, 1050/1051 stayed silent on Feather */
     wrHex(g_chCmd,  "05008119ec7d050081189005008119ec3f05008119ec12");
     delay(250);
+#if INIT_BULK_TRIM
+    /* the captured 0004 write was a 20-byte chunk ending in an incomplete "05 00" GET; that
+     * dangling prefix glued onto our next 0004 write (replies seen one request late) */
+    wrHex(g_chBulk, "05008119ec0f05008119ec0e05008119010c");
+#else
     wrHex(g_chBulk, "05008119ec0f05008119ec0e05008119010c0500");
+#endif
     delay(200);
     wrHex(g_chCtrl, "f941");
-    g_histNextMs = millis() + 2000;
-    logln(job == JOB_HIST ? "OK gatt hist day0+day1" : "OK gatt pv_burst");
-    if (job == JOB_HIST) {
-        int y = yesterdayYmd();
-        int t = todayYmd();
-        if (!y || !g_yday.ok || g_yday.ymd != y)
-            memset(&g_yday, 0, sizeof(g_yday));
-        if (!t || !g_today.ok || g_today.ymd != t)
-            memset(&g_today, 0, sizeof(g_today));
-    }
+    /* hist: first request right away (device drops the link ~10 s after connect) */
+    g_histNextMs = millis() + 150;   /* rev6: pv starts at the same point as hist (was +2000 for pv) */
+    if (job == JOB_HIST) g_wrMask = HIST_WRITE_CHARS;
+    if (job == JOB_PV) g_wrMask = PV_WRITE_CHARS;
+    logln(job == JOB_HIST ? "OK gatt hist" : "OK gatt pv_burst");
     if (job == JOB_PV) {
         g_havePvV = g_havePvW = g_havePvA = false;
         g_pvV = g_pvWatt = g_pvA = NAN;
@@ -956,64 +1420,255 @@ static bool gattBurst(int job) {
     return true;
 }
 
-static void histTick() {
-    if (g_mode != MODE_GATT || g_job != JOB_HIST) return;
-    if (g_yday.ok) { histFinish(); return; }
-    if (millis() - g_gattStartMs > 26000) { histFinish(); return; }
-    if ((int32_t)(millis() - g_histNextMs) < 0) return;
-    if (!g_sawNotify && millis() - g_gattStartMs < 5000) {
+static int histNextPending(int from) {
+    for (int d = from; d <= g_histN; d++)
+        if (g_dayState[d] == DAY_PENDING) return d;
+    return -1;
+}
+/* one request for day d. rev4 log: ONLY "05 03 81 19 HI LO" (channel/seq byte 03, the Mac capture
+ * form) returned history pages. 05 s 82 / 05 s 81 with s != 03 got 09 flag 01 or no reply.
+ * The register encoding (big-endian after 0x19) is correct — same as the init capture "19 ec 66"
+ * and the reply decoder. Attempts differ only in the target characteristic:
+ *   try0: HIST_WRITE_CHARS (default 0003)  try1: 0004  try2: both */
+static void histSendDay(int d) {
+    uint16_t regs[2];
+    int n = 0;
+    regs[n++] = (uint16_t)(REG_HIST_DAY0 + d);
+#if HIST_ASK_MPPT_X
+    regs[n++] = (uint16_t)(REG_HIST_MPPT0 + d);
+#endif
+    uint8_t t = g_dayTries[d] % 3;
+    g_wrMask = (t == 0) ? (uint8_t)HIST_WRITE_CHARS : (t == 1) ? 2 : 3;
+    g_dayErr[d] = 0;
+    getRegs81Concat(regs, n);
+    wrHex(g_chCtrl, "f941");
+    if (g_dayTries[d] < 255) g_dayTries[d]++;
+    g_histDeadline = millis() + HIST_DAY_TIMEOUT_MS;
+}
+/* after the day loop: EDD1/EDD0/EDD3/EDD2 once if day0/day1 page is missing */
+static void histDone() {
+    if (!g_histFbSent && (!g_today.ok || (g_histN >= 1 && !g_yday.ok))) {
+        static const uint16_t fb[] = { REG_EDD1, REG_EDD0, REG_EDD3, REG_EDD2 };
+        g_wrMask = HIST_WRITE_CHARS;
+        getRegs81Concat(fb, 4);                 /* 05 03 81 per reg — the only form answered */
         wrHex(g_chCtrl, "f941");
-        g_histNextMs = millis() + 500;
+        g_histFbSent = true;
+        g_histFbUntil = millis() + HIST_FB_WAIT_MS;
+        logln("TX hist EDDx fallback");
         return;
     }
-    static const uint16_t yfirst[] = {
-        REG_YDAY, REG_YDAY_X, REG_EDD1, REG_EDD0
-    };
-    static const uint16_t todayb[] = {
-        REG_TODAY, REG_TODAY_X, REG_EDD3, REG_EDD2
-    };
-    if (g_histPhase == 0) {
-        getRegs81Concat(yfirst, 4);
-        wrHex(g_chCtrl, "f941");
-        logln("TX hist81 yday first 1051");
-        g_histPhase = 1; g_histNextMs = millis() + 800; return;
-    }
-    if (g_histPhase == 1) {
-        getRegs(yfirst, 4, 0x82);
-        logln("TX hist82 yday 1051");
-        g_histPhase = 2; g_histNextMs = millis() + 1200; return;
-    }
-    if (g_histPhase == 2) {
-        if (g_yday.ok) { histFinish(); return; }
-        getRegs81Concat(todayb, 4);
-        g_histPhase = 3; g_histNextMs = millis() + 1500; return;
-    }
-    g_histPhase = 0;
     histFinish();
 }
 
+static void histTick() {
+    if (g_mode != MODE_GATT || g_job != JOB_HIST) return;
+    uint32_t age = millis() - g_gattStartMs;
+    if (age > HIST_SESSION_END_MS) {        /* clean disconnect before the device's ~10 s drop */
+        histSessionEnd(true);
+        return;
+    }
+    if (g_histFbSent) {
+        if ((int32_t)(millis() - g_histFbUntil) >= 0) histFinish();
+        return;
+    }
+    if ((int32_t)(millis() - g_histNextMs) < 0) return;
+    if (!g_sawNotify && age < 2000) {
+        wrHex(g_chCtrl, "f941");
+        g_histNextMs = millis() + 300;
+        return;
+    }
+    if (HIST_KEEPALIVE_MS && millis() - g_lastTxMs > HIST_KEEPALIVE_MS) {
+        wrHex(g_chCtrl, "f941");
+        g_lastTxMs = millis();
+    }
+    if (g_histSessStop) return;              /* waiting for late replies until SESSION_END */
+    if (age > HIST_SESSION_MS) {
+        g_histSessStop = true;
+        /* rev5: no flush GET — init trim removed the one-write lag, and s!=03 GETs are ignored */
+        logf("STEP hist session time up at +%lums — draining", (unsigned long)age);
+        return;
+    }
+    if (g_histDay < 0) {                     /* first day of this session */
+        g_histDay = histNextPending(0);
+        if (g_histDay < 0) { histDone(); return; }
+        histSendDay(g_histDay);
+        return;
+    }
+    if (g_histNeedSend) {
+        if (millis() - g_lastReplyMs < HIST_QUIET_MS) return;   /* replies still arriving */
+        g_histNeedSend = false;
+        histSendDay(g_histDay);
+        return;
+    }
+    int d = g_histDay;
+    if (g_dayState[d] == DAY_PENDING) {
+        bool err = g_dayErr[d] != 0;
+        if (!err && (int32_t)(millis() - g_histDeadline) < 0) return;   /* still waiting */
+        if (!err && millis() - g_lastReplyMs < HIST_QUIET_MS) return;
+        if (g_dayTries[d] <= HIST_DAY_RETRIES) {
+            logf("RETRY day%d try=%u%s", d, (unsigned)g_dayTries[d], err ? " (after 09)" : "");
+            histSendDay(d);
+            return;
+        }
+        if (err) {
+            logf("NOTE day%d only 09 flag=0x%02X after %u tries — empty", d,
+                 (unsigned)g_dayErr[d], (unsigned)g_dayTries[d]);
+            g_dayState[d] = DAY_EMPTY;
+        } else {
+            logf("FAIL day%d no reply after %u tries", d, (unsigned)g_dayTries[d]);
+            g_dayState[d] = DAY_FAIL;
+        }
+    }
+    /* day d finished (ok / empty / fail) */
+    g_histSessDays++;
+    if (g_dayState[d] == DAY_OK) g_histEmptyRun = 0;
+    else if (++g_histEmptyRun >= HIST_EMPTY_STOP && d >= 1) {
+        logf("NOTE %u empty/failed days in a row at day%d — stop", (unsigned)g_histEmptyRun, d);
+        for (int k = d + 1; k <= g_histN; k++) if (g_dayState[k] == DAY_PENDING) g_dayState[k] = DAY_SKIP;
+        histDone();
+        return;
+    }
+    int nx = histNextPending(d + 1);
+    if (nx < 0) { histDone(); return; }
+    if (g_histSessDays >= HIST_DAYS_PER_SESSION) {   /* K days done: reconnect for the rest */
+        histSessionEnd(true);
+        return;
+    }
+    g_histDay = nx;
+    g_histNeedSend = true;
+    g_histNextMs = millis() + HIST_GAP_MS;
+}
+
+static bool pvHave(int k) {
+    return k == 0 ? g_havePvV : k == 1 ? g_havePvW : g_havePvA;
+}
+static void pvNext() {                    /* current pv reg closed (ok / 09 / failed) */
+    g_pvPhase++;
+    g_pvTry = 0;
+    g_pvErr = 0;
+    /* rev7: after the last reg go straight on (rev11: EDBC push wait, then publish + disconnect) */
+    g_histNextMs = millis() + (g_pvPhase < PV_NREGS ? PV_GAP_MS : 0);
+}
+/* rev6: sequential like hist — one getRegs 81 n=1 at a time, the next reg only after the
+ * 08 reply for the current reg (matched by reg id, not seq), a 09 for it, or a timeout.
+ * timeout → one retry. stale / duplicate frames are dropped in parseFrames. */
 static void pvTick() {
     if (g_mode != MODE_GATT || g_job != JOB_PV) return;
     if ((int32_t)(millis() - g_histNextMs) < 0) return;
-    if (g_pvPhase == 0) { getReg(REG_PV_V); logln("TX pv EDBB"); g_pvPhase = 1; g_histNextMs = millis() + 300; return; }
-    if (g_pvPhase == 1) { getReg(REG_PV_W); logln("TX pv EDBC"); g_pvPhase = 2; g_histNextMs = millis() + 300; return; }
-    if (g_pvPhase == 2) { getReg(REG_PV_A); logln("TX pv EDBD"); g_pvPhase = 3; g_histNextMs = millis() + 800; return; }
+    uint32_t age = millis() - g_gattStartMs;
+    if (g_pvPhase < PV_NREGS) {
+        int k = g_pvPhase;
+        uint16_t reg = PV_REGS[k];
+        if (pvHave(k)) {                  /* 08 for this reg arrived (possibly before we asked) */
+            if (g_pvTry) logf("RX pv reg=0x%04X ok try=%u +%lums", (unsigned)reg, (unsigned)g_pvTry, (unsigned long)age);
+            else logf("STEP pv reg=0x%04X already received — skip", (unsigned)reg);
+            pvNext();
+            return;
+        }
+        if (g_pvTry && g_pvErr) {
+            logf("NOTE pv reg=0x%04X rejected 09 flag=0x%02X — next", (unsigned)reg, (unsigned)g_pvErr);
+            pvNext();
+            return;
+        }
+        if (g_pvTry && (int32_t)(millis() - g_pvDeadline) < 0) return;   /* still waiting */
+        if (g_pvTry > PV_RETRIES) {
+            logf("FAIL pv reg=0x%04X no reply after %u tries", (unsigned)reg, (unsigned)g_pvTry);
+            pvNext();
+            return;
+        }
+        if (age + PV_REPLY_TIMEOUT_MS > PV_SESSION_MS) {
+            logf("STEP pv time up at +%lums — reg=0x%04X not sent", (unsigned long)age, (unsigned)reg);
+            g_pvPhase = PV_NREGS;
+            g_pvTry = 0;
+            return;
+        }
+        if (g_pvTry) logf("RETRY pv reg=0x%04X try=%u", (unsigned)reg, (unsigned)g_pvTry);
+        g_pvErr = 0;
+        pvGetReg(reg);
+        logf("TX pv %04X try=%u s=%02X", (unsigned)reg, (unsigned)g_pvTry, (unsigned)PV_SEQ);
+        g_pvTry++;
+        g_pvDeadline = millis() + PV_REPLY_TIMEOUT_MS;
+        return;
+    }
+    /* rev11: EDBB handled — EDBC comes only as an unsolicited push. publish as soon as it is in,
+     * or after PV_EDBC_WAIT_MS from here (never past PV_SESSION_MS from connect) */
+    if (!g_pvEdbcDone) {
+        if (g_havePvW) {
+            if (g_pvEdbcWait) logf("RX pv EDBC push after %lums wait +%lums",
+                                   (unsigned long)(millis() - g_pvEdbcStart), (unsigned long)age);
+            else logf("STEP pv EDBC already pushed — no wait +%lums", (unsigned long)age);
+            g_pvEdbcDone = true;
+        } else if (!g_pvEdbcWait) {
+            g_pvEdbcWait = true;
+            g_pvEdbcStart = millis();
+            uint32_t w = PV_EDBC_WAIT_MS;
+            if (age + w > PV_SESSION_MS) w = (age < PV_SESSION_MS) ? PV_SESSION_MS - age : 0;
+            g_pvEdbcUntil = millis() + w;
+            logf("STEP pv wait EDBC push up to %lums +%lums", (unsigned long)w, (unsigned long)age);
+            return;
+        } else if ((int32_t)(millis() - g_pvEdbcUntil) < 0) {
+            return;                       /* still waiting (polled every loop) */
+        } else {
+            logf("NOTE pv EDBC no push within %lums", (unsigned long)(millis() - g_pvEdbcStart));
+            g_pvEdbcDone = true;
+        }
+    }
+    /* nothing came back for 05 seq(1..23) 81: one fallback with the original seq=0 form
+     * (that is what pv used before, and the init strings use seq 00 too) */
+    if (!g_havePvV && !g_havePvW && !g_havePvA && !g_pvFbSent && age + PV_FB_WAIT_MS <= PV_SESSION_MS) {
+        for (int k = 0; k < PV_NREGS; k++) {
+            const uint16_t *pv = PV_REGS;
+            uint8_t pkt[6] = { 0x05, 0x00, 0x81, 0x19, (uint8_t)(pv[k] >> 8), (uint8_t)pv[k] };
+            wrBoth(pkt, 6);
+            delay(30);
+        }
+        logln("TX pv fallback seq=00");
+        g_pvFbSent = true;
+        g_histNextMs = millis() + PV_FB_WAIT_MS;
+        return;
+    }
     g_pvPhase = 0;
     g_wantPv = false;
     pubPv();
-    logln("STEP pv_done disconnect");
+    logf("STEP pv_done disconnect +%lums", (unsigned long)age);
     gattDrop();
 }
 
 static void maybeGatt() {
     if (g_mode != MODE_ADV) return;
+    if (g_connFails >= CONN_FAIL_RESET) {     /* recovery: wipe host state incl. all clients */
+        logf("STEP %u consecutive GATT failures", (unsigned)g_connFails);
+        bleStackReset();
+        bleScanStart();
+        return;
+    }
     if (!g_wantHist && !g_wantPv) return;
     static uint32_t last;
-    if (millis() - last < 12000) return;
+    uint32_t gap = (g_wantHist && g_histCont) ? HIST_RECONNECT_MS : 12000UL;
+    if (millis() - last < gap) return;
     last = millis();
     if (!fresh(DEV_MPPT)) { logln("WAIT mppt adv"); return; }
     int job = g_wantHist ? JOB_HIST : JOB_PV;
     gattBurst(job);
+}
+
+static void handlePeerDrop() {
+    if (!g_peerDrop) return;
+    g_peerDrop = false;
+    NimBLEClient *c = g_dropCli;
+    logf("STEP drop 0x%03x", g_dropReason);   /* 0x208 sup. timeout, 0x213 remote, 0x216 local, 0x23e est. fail */
+    if (g_mode != MODE_GATT || c != g_cli) return;   /* our own gattDrop / failure path */
+    logf("STEP peer dropped session -> ADV age=%lums lastTx s=%02X +%lums lastRx +%lums rx02=%lu rx03=%lu rx04=%lu",
+         (unsigned long)(millis() - g_gattStartMs), (unsigned)g_lastTxSeq,
+         (unsigned long)(g_lastTxMs - g_gattStartMs), (unsigned long)(g_lastRxMs - g_gattStartMs),
+         (unsigned long)g_rxBytesCh[0], (unsigned long)g_rxBytesCh[1], (unsigned long)g_rxBytesCh[2]);
+    bool wasHist = (g_job == JOB_HIST);
+    if (g_connFails < 255) g_connFails++;
+    if (wasHist) {
+        histSessionEnd(true);                 /* gattDrop + resume remaining days in a new session */
+        return;
+    }
+    gattDrop();                               /* deletes the dead client (was leaked before) */
 }
 
 void setup() {
@@ -1023,13 +1678,12 @@ void setup() {
     pinMode(PIN_LED, OUTPUT);
     led(true);
     prefs.begin("vtgatt", false);
-    recLoad("today", g_today);
-    recLoad("yday", g_yday);
-    Serial.println("\n=== HUZZAH32 Victron ADV 10s + GATT day0+day1 NTP ===");
-    Serial.printf("PIN compile %06lu today=%d/%d yday=%d/%d\n",
-                  (unsigned long)g_pin, (int)g_today.ok, g_today.ymd,
-                  (int)g_yday.ok, g_yday.ymd);
-    Serial.println("cmd: {\"cmd\":\"hist\"} | {\"cmd\":\"pv\"} | {\"cmd\":\"unpair\"}");
+    prefs.remove("today");                    /* old single-slot keys, replaced by ring h00..h39 */
+    prefs.remove("yday");
+    Serial.println("\n=== HUZZAH32 Victron ADV 10s + GATT day0..N NTP ===");
+    Serial.printf("PIN compile %06lu hist_days=%d reset=%d\n",
+                  (unsigned long)g_pin, HIST_DAYS, (int)esp_reset_reason());
+    Serial.println("cmd: {\"cmd\":\"hist\"} | {\"cmd\":\"hist\",\"days\":30} | {\"cmd\":\"pv\"} | {\"cmd\":\"unpair\"}");
     wifiConnect();
     uint32_t t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(200);
@@ -1045,30 +1699,35 @@ void setup() {
 void loop() {
     mqttKeep();
     drainRx();
+    handlePeerDrop();
     if (g_histPubPending) {
         g_histPubPending = false;
-        if (g_today.ok) pubDay(g_today, "today", 0);
-        if (g_yday.ok) pubDay(g_yday, "yesterday", 1);
+        pubHistAll();
     }
-    if (g_mode == MODE_GATT && g_job == JOB_HIST && g_yday.ok)
-        histFinish();
     publishLive();
     publishStatus();
     if (g_wantUnpair) {
         g_wantUnpair = false;
-        gattDrop();
+        if (g_mode == MODE_GATT) gattDrop();
         NimBLEDevice::deleteAllBonds();
-        memset(&g_yday, 0, sizeof(g_yday));
-        memset(&g_today, 0, sizeof(g_today));
-        prefs.remove("yday");
-        prefs.remove("today");
+        memset(g_day, 0, sizeof(g_day));
+        cacheClear();
         logln("STEP unpair + hist nvs reset");
         bleScanStart();
     }
-    if (g_mode == MODE_GATT && millis() - g_gattStartMs > 28000) {
-        logln("FAIL gatt timeout");
-        if (g_job == JOB_HIST) histFinish();
-        else gattDrop();
+    if (g_mode == MODE_GATT) {
+        uint32_t lim = (g_job == JOB_HIST) ? g_histBudgetMs + 3000UL : 28000UL;
+        if (millis() - g_gattStartMs > lim) {
+            logln("FAIL gatt timeout");
+            if (g_connFails < 255) g_connFails++;
+            if (g_job == JOB_HIST) histSessionEnd(true);
+            else gattDrop();
+        }
+    }
+    /* periodic scan restart: clears any results left by scannable devices without scan response */
+    if (g_mode == MODE_ADV && millis() - g_lastScanRst > SCAN_RESTART_MS) {
+        NimBLEDevice::getScan()->start(0, false, true);
+        g_lastScanRst = millis();
     }
     maybeGatt();
     histTick();

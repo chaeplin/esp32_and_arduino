@@ -266,8 +266,6 @@ def _influx_token() -> str:
         HERE / "influx.env",
         Path.cwd() / "influx.token",
         Path.cwd() / "influx.env",
-        Path.home() / "influx.token",
-        Path.home() / "influx.env",
     ):
         try:
             if p.is_file():
@@ -811,8 +809,10 @@ body.only-days .matwrap { margin:0; border-radius:0; min-height:100dvh; }
       </div>
     </div>
   </div>
-  <div class="matwrap" id="daymat"><table class="mat"><tr><th></th><th class="on">오늘</th><th class="on">어제</th><th>09/29</th><th>09/28</th><th>09/27</th><th>09/26</th><th>09/25</th><th>09/24</th><th>09/23</th><th>09/22</th><th>09/21</th><th>09/20</th><th>09/19</th><th>09/18</th><th>09/17</th></tr><tr><td>수율 Wh</td><td class="on">0</td><td class="on">120</td><td>130</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td></tr><tr><td>최대 P W</td><td class="on">0</td><td class="on">23</td><td>23</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td></tr><tr><td>최대 Vpv</td><td class="on">1.68</td><td class="on">36.30</td><td>37.20</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td></tr><tr><td>배터리 최대</td><td class="on">12.84</td><td class="on">13.43</td><td>13.48</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td></tr><tr><td>배터리 최소</td><td class="on">12.77</td><td class="on">12.64</td><td>12.62</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td></tr><tr><td>소비 Wh</td><td class="on">10</td><td class="on">100</td><td>110</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td></tr></table></div>
-  <div class="hint">15일 · 오늘 소비: 수율 0이면 부하전력 적분 예상, 수율 생기면 어제 비율 추정으로 바뀜.</div>
+  <div class="matwrap" id="daymat"></div>
+  <div class="hint">최근 15일 · bulk/abs/float 는 그 단계에 머문 분. err 는 최근 에러 코드 4개.</div>
+  <div class="matwrap" id="daymat2"></div>
+  <div class="hint">그 이전 15일 (day16–30).</div>
 </div>
 <script>
 if (new URLSearchParams(location.search).get('only')==='days') document.body.classList.add('only-days');
@@ -869,10 +869,12 @@ function set3(id, cur, arr, dp){
   document.getElementById(id+'_min').textContent = r ? r[0].toFixed(dp) : '—';
   document.getElementById(id+'_max').textContent = r ? r[1].toFixed(dp) : '—';
 }
-function ymdList(){
+function ymdList(n, off){
+  n = (n==null) ? 15 : n;
+  off = off||0;
   const out=[];
   const fmt = new Intl.DateTimeFormat('en-CA', {timeZone:'Asia/Seoul', year:'numeric', month:'2-digit', day:'2-digit'});
-  for (let i=0;i<=14;i++){
+  for (let i=off;i<off+n;i++){
     const d = new Date(Date.now() - i*86400000);
     out.push(fmt.format(d).replace(/-/g,''));
   }
@@ -919,19 +921,26 @@ function recOf(ymd){
   if (vbm!=null) out.vbat_min = vbm;
   return out;
 }
-function renderMat(){
-  const el = document.getElementById('daymat');
-  if (!el) return;
-  const keys = ymdList();
-  const today = keys[0];
-  const yest = keys[1];
+function errTxt(v){
+  if (v==null || v==='') return '—';
+  if (Array.isArray(v)) return v.join(',');
+  return String(v);
+}
+function matTable(keys){
+  const today = ymdList()[0];
+  const yest = ymdList()[1];
   const rows = [
     ['수율 Wh', d => (d.yield_kwh!=null?d.yield_kwh*1000:null), 0],
     ['최대 P W', d => d.pmax_w, 0],
     ['최대 Vpv', d => d.vpv_max, 2],
     ['배터리 최대', d => d.vbat_max, 2],
     ['배터리 최소', d => d.vbat_min, 2],
-    ['소비 Wh', d => (d.consumed_kwh!=null?d.consumed_kwh*1000:null), 0, true],
+    ['최대 Ibat', d => d.ibat_max, 1],
+    ['소비 Wh', d => (d.consumed_kwh!=null?d.consumed_kwh*1000:null), 0],
+    ['bulk 분', d => d.bulk_min, 0],
+    ['abs 분', d => d.abs_min, 0],
+    ['float 분', d => d.float_min, 0],
+    ['err', d => d.err, 'err'],
   ];
   let th = '<tr><th></th>';
   keys.forEach(k => {
@@ -946,7 +955,7 @@ function renderMat(){
       const rec = recOf(k);
       const v = get(rec);
       const on = (k===today||k===yest) ? ' class="on"' : '';
-      let txt = f(v, dp, '');
+      let txt = (dp==='err') ? errTxt(v) : f(v, dp, '');
       if (name==='소비 Wh' && k===today && v!=null){
         txt += rec.consumed_src==='ratio' ? '<div class="est">추정·수율비</div>' :
                rec.consumed_src==='gatt' ? '' : '<div class="est">추정·부하</div>';
@@ -955,7 +964,13 @@ function renderMat(){
     });
     body += '</tr>';
   });
-  el.innerHTML = '<table class="mat">'+th+body+'</table>';
+  return '<table class="mat">'+th+body+'</table>';
+}
+function renderMat(){
+  const el = document.getElementById('daymat');
+  const el2 = document.getElementById('daymat2');
+  if (el) el.innerHTML = matTable(ymdList(15, 0));
+  if (el2) el2.innerHTML = matTable(ymdList(15, 15));
 }
 try { renderMat(); } catch (e) { console.log(e); }
 
