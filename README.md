@@ -18,7 +18,7 @@ Decrypts BLE advertisements, publishes MQTT JSON, and opens short GATT sessions 
 
 Built with [SuperGrok](https://grok.com) / Grokbot from captured ADV / GATT packets and Feather serial logs. Not an official Victron SDK.
 
-[README](./victron-ble-mqtt/README.md) · [한국어](./victron-ble-mqtt/README.ko.md) · MIT
+[README](./victron-ble-mqtt/README.md) · MIT
 
 </td>
 </tr>
