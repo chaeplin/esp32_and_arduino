@@ -28,13 +28,13 @@ ADV / GATT 패킷 캡처와 Feather 시리얼 로그를 [슈퍼그록(SuperGrok)
 <tr>
 <td>
 
-### [sunkeeper-ble](https://github.com/chaeplin/esp32_and_arduino/tree/master/sunkeeper-ble)
+### [sunseeker-ble](https://github.com/chaeplin/esp32_and_arduino/tree/master/sunseeker-ble)
 
 Sunseeker V3 Plus BLE 게이트웨이 · 위치 맵 · 컨트롤 패드.
 
 ESP32 Feather가 잔디깎이에 BLE(AES-256-ECB + Base64 JSON)로 붙어 MQTT로 중계합니다. Python이 조종 패드(`:8765`)와 위치 맵(`:8767`)을 띄웁니다. InfluxDB 궤적은 선택입니다.
 
-[README](./sunkeeper-ble/README.md) · MIT
+[README](./sunseeker-ble/README.md) · MIT
 
 </td>
 </tr>
