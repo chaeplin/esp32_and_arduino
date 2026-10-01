@@ -24,6 +24,22 @@ Built with [SuperGrok](https://grok.com) / Grokbot from captured ADV / GATT pack
 </tr>
 </table>
 
+<table>
+<tr>
+<td>
+
+### [sunkeeper-ble](https://github.com/chaeplin/esp32_and_arduino/tree/master/sunkeeper-ble)
+
+ESP32 Feather BLE gateway for a Sunseeker V3 Plus robot mower.
+
+The board talks to the mower over BLE (AES-256-ECB, Base64 JSON) and bridges to MQTT. Python serves a control pad (`:8765`) and a live position map (`:8767`, optional InfluxDB track).
+
+[README](./sunkeeper-ble/README.md) · MIT
+
+</td>
+</tr>
+</table>
+
 <!--
 Add the next project by copying this block:
 
