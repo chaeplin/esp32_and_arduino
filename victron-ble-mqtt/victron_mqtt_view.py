@@ -26,13 +26,6 @@ from urllib.parse import parse_qs, urlparse
 
 import paho.mqtt.client as mqtt
 
-MQTT_HOST = os.environ.get("MQTT_HOST", "YOUR_MQTT_HOST")
-MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
-MQTT_USER = os.environ.get("MQTT_USER", "YOUR_MQTT_USER")
-MQTT_PASS = os.environ.get("MQTT_PASSWORD", os.environ.get("MQTT_PASS", "YOUR_MQTT_PASSWORD"))
-HTTP_HOST = "0.0.0.0"
-HTTP_PORT = 8772
-
 TOPIC_MPPT = "victron/mppt"
 TOPIC_SENSE = "victron/sense"
 TOPIC_STATUS = "victron/status"
@@ -41,6 +34,27 @@ TOPIC_PV = "victron/mppt/pv"
 TOPIC_LWT = "victron/lwt"
 
 HERE = Path(__file__).resolve().parent
+
+def _load_dotenv() -> None:
+    for path in (HERE / ".env", Path.cwd() / ".env"):
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip("'").strip('"')
+            if k and k not in os.environ:
+                os.environ[k] = v
+
+_load_dotenv()
+MQTT_HOST = os.environ.get("MQTT_HOST", "YOUR_MQTT_HOST")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
+MQTT_USER = os.environ.get("MQTT_USER", "YOUR_MQTT_USER")
+MQTT_PASS = os.environ.get("MQTT_PASSWORD", os.environ.get("MQTT_PASS", "YOUR_MQTT_PASSWORD"))
+HTTP_HOST = "0.0.0.0"
+HTTP_PORT = 8772
 KST = ZoneInfo("Asia/Seoul")
 DAYS_FILE = HERE / "victron_days.json"
 PV_FILE = HERE / "victron_pv.json"
@@ -266,6 +280,8 @@ def _influx_token() -> str:
         HERE / "influx.env",
         Path.cwd() / "influx.token",
         Path.cwd() / "influx.env",
+        Path.home() / "influx.token",
+        Path.home() / "influx.env",
     ):
         try:
             if p.is_file():
@@ -740,11 +756,29 @@ table.mm td:first-child, table.mm th:first-child { text-align:left; color:#8aa0b
 table.mm td { font-weight:700; }
 .matwrap { overflow-x:auto; margin-top:12px; background:#1c2b3a; border-radius:12px; padding:8px; }
 table.mat { width:100%; border-collapse:collapse; font-size:12px; min-width:720px; }
-table.mat th, table.mat td { padding:5px 4px; text-align:right; white-space:nowrap; }
+table.mat th, table.mat td { padding:5px 4px; text-align:right; white-space:nowrap; vertical-align:bottom; }
 table.mat th:first-child, table.mat td:first-child { text-align:left; color:#8aa0b3; position:sticky; left:0; background:#1c2b3a; }
 table.mat th { color:#c5d4e0; font-weight:700; }
 table.mat .on { background:#243646; }
 table.mat .est { display:block; font-size:10px; font-weight:600; color:#8aa0b3; }
+.stcell { position:relative; display:flex; justify-content:center; overflow:visible; }
+.stcell:hover .sttip { display:block; }
+.stcell.flip .sttip { left:auto; right:calc(50% + 16px); }
+.sttip {
+  display:none; position:absolute; left:calc(50% + 16px); bottom:12px;
+  transform:none; z-index:8;
+  background:#1a2733; border:1px solid #5b8fb8; border-radius:8px;
+  padding:6px 8px; font-size:11px; line-height:1.45; white-space:nowrap;
+  color:#e8eef4; box-shadow:0 6px 16px rgba(0,0,0,.35); pointer-events:none;
+}
+.sttip b { font-variant-numeric:tabular-nums; }
+.sttrack { height:120px; display:flex; align-items:flex-end; justify-content:center; position:relative; }
+.stbar { width:28px; min-height:3px; display:flex; flex-direction:column-reverse; background:#243646; border-radius:3px 3px 0 0; overflow:hidden; }
+.stbar.empty { background:#1a2733; }
+.stbar .stb { background:#d9dde2; width:100%; }
+.stbar .sta { background:#9eb4c7; width:100%; }
+.stbar .stf { background:#5b8fb8; width:100%; }
+.stpct { display:block; font-size:10px; font-weight:600; color:#8aa0b3; }
 .hint { color:#6d8296; font-size:12px; padding:8px 4px 0; }
 body.only-days header, body.only-days .grid { display:none !important; }
 body.only-days .matwrap { margin:0; border-radius:0; min-height:100dvh; }
@@ -810,9 +844,9 @@ body.only-days .matwrap { margin:0; border-radius:0; min-height:100dvh; }
     </div>
   </div>
   <div class="matwrap" id="daymat"></div>
-  <div class="hint">최근 15일 · bulk/abs/float 는 그 단계에 머문 분. err 는 최근 에러 코드 4개.</div>
+  <div class="hint">최근 15일 · 막대에 올리면 벌크/흡수/플로트 시간과 비율. 오류 0,0,0,0 은 0.</div>
   <div class="matwrap" id="daymat2"></div>
-  <div class="hint">그 이전 15일 (day16–30).</div>
+  <div class="hint">그 이전 15일 (day16–30). 오류 0,0,0,0 은 0, 난 코드만 표시.</div>
 </div>
 <script>
 if (new URLSearchParams(location.search).get('only')==='days') document.body.classList.add('only-days');
@@ -922,14 +956,52 @@ function recOf(ymd){
   return out;
 }
 function errTxt(v){
-  if (v==null || v==='') return '—';
-  if (Array.isArray(v)) return v.join(',');
-  return String(v);
+  let arr = [];
+  if (v==null || v==='') return '0';
+  if (Array.isArray(v)) arr = v.map(Number);
+  else if (typeof v === 'string') arr = v.split(/[,\s]+/).map(Number);
+  else arr = [Number(v)];
+  const nz = arr.filter(x => Number.isFinite(x) && x !== 0);
+  return nz.length ? nz.join(',') : '0';
+}
+function fmtMin(m){
+  if (m==null || m==='') return '—';
+  m = Number(m);
+  if (!Number.isFinite(m) || m < 0) return '—';
+  if (m < 60) return Math.round(m) + 'm';
+  const h = Math.floor(m/60), r = Math.round(m % 60);
+  return r ? (h + '시간 ' + r + '분') : (h + '시간');
+}
+function stageParts(d){
+  const b = Number(d.bulk_min), a = Number(d.abs_min), fl = Number(d.float_min);
+  const bb = Number.isFinite(b) ? b : 0;
+  const aa = Number.isFinite(a) ? a : 0;
+  const ff = Number.isFinite(fl) ? fl : 0;
+  const t = bb + aa + ff;
+  return {b:bb, a:aa, f:ff, t:t};
+}
+function stageBar(d, flip){
+  const s = stageParts(d);
+  const y = (d.yield_kwh!=null) ? Number(d.yield_kwh)*1000 : 0;
+  const h = Math.max((s.t || y) ? 8 : 3, Math.min(100, (y/250)*100));
+  if (!s.t) return '<div class="stcell"><div class="sttrack"><div class="stbar empty" style="height:'+h+'%"></div></div></div>';
+  const tip = '<div>벌크충전 <b>'+fmtMin(s.b)+'</b> '+Math.round(100*s.b/s.t)+'%</div>'
+            + '<div>흡수충전 <b>'+fmtMin(s.a)+'</b> '+Math.round(100*s.a/s.t)+'%</div>'
+            + '<div>플로트 <b>'+fmtMin(s.f)+'</b> '+Math.round(100*s.f/s.t)+'%</div>';
+  return '<div class="stcell'+(flip?' flip':'')+'">'
+    + '<div class="sttrack"><div class="stbar" style="height:'+h+'%">'
+    + '<span class="stb" style="height:'+(100*s.b/s.t).toFixed(1)+'%"></span>'
+    + '<span class="sta" style="height:'+(100*s.a/s.t).toFixed(1)+'%"></span>'
+    + '<span class="stf" style="height:'+(100*s.f/s.t).toFixed(1)+'%"></span>'
+    + '</div></div>'
+    + '<div class="sttip">'+tip+'</div>'
+    + '</div>';
 }
 function matTable(keys){
   const today = ymdList()[0];
   const yest = ymdList()[1];
   const rows = [
+    ['충전단계', (d, i, n) => stageBar(d, i >= n - 3), 'html'],
     ['수율 Wh', d => (d.yield_kwh!=null?d.yield_kwh*1000:null), 0],
     ['최대 P W', d => d.pmax_w, 0],
     ['최대 Vpv', d => d.vpv_max, 2],
@@ -937,10 +1009,7 @@ function matTable(keys){
     ['배터리 최소', d => d.vbat_min, 2],
     ['최대 Ibat', d => d.ibat_max, 1],
     ['소비 Wh', d => (d.consumed_kwh!=null?d.consumed_kwh*1000:null), 0],
-    ['bulk 분', d => d.bulk_min, 0],
-    ['abs 분', d => d.abs_min, 0],
-    ['float 분', d => d.float_min, 0],
-    ['err', d => d.err, 'err'],
+    ['오류', d => d.err, 'err'],
   ];
   let th = '<tr><th></th>';
   keys.forEach(k => {
@@ -951,11 +1020,14 @@ function matTable(keys){
   let body = '';
   rows.forEach(([name, get, dp]) => {
     body += '<tr><td>'+name+'</td>';
-    keys.forEach(k => {
+    keys.forEach((k, i) => {
       const rec = recOf(k);
-      const v = get(rec);
+      const v = (dp==='html') ? get(rec, i, keys.length) : get(rec);
       const on = (k===today||k===yest) ? ' class="on"' : '';
-      let txt = (dp==='err') ? errTxt(v) : f(v, dp, '');
+      let txt;
+      if (dp==='html') txt = v;
+      else if (dp==='err') txt = errTxt(v);
+      else txt = f(v, dp, '');
       if (name==='소비 Wh' && k===today && v!=null){
         txt += rec.consumed_src==='ratio' ? '<div class="est">추정·수율비</div>' :
                rec.consumed_src==='gatt' ? '' : '<div class="est">추정·부하</div>';
@@ -966,11 +1038,28 @@ function matTable(keys){
   });
   return '<table class="mat">'+th+body+'</table>';
 }
+function bindTips(root){
+  if (!root) return;
+  root.querySelectorAll('.stcell').forEach(el => {
+    el.addEventListener('mouseenter', () => {
+      const tip = el.querySelector('.sttip');
+      if (!tip) return;
+      el.classList.remove('flip');
+      tip.style.display = 'block';
+      const wrap = el.closest('.matwrap');
+      const wr = wrap ? wrap.getBoundingClientRect() : {right: window.innerWidth};
+      const tr = tip.getBoundingClientRect();
+      if (tr.right > wr.right - 6) el.classList.add('flip');
+      tip.style.display = '';
+    });
+  });
+}
 function renderMat(){
   const el = document.getElementById('daymat');
   const el2 = document.getElementById('daymat2');
   if (el) el.innerHTML = matTable(ymdList(15, 0));
-  if (el2) el2.innerHTML = matTable(ymdList(15, 15));
+  if (el2) el2.innerHTML = matTable(ymdList(16, 15));
+  bindTips(el); bindTips(el2);
 }
 try { renderMat(); } catch (e) { console.log(e); }
 
