@@ -12,7 +12,7 @@ ESP32 / Arduino sketches and local bridges. More projects will be added as folde
 
 Local ESP32 (Adafruit HUZZAH32) bridge for Victron Instant Readout.
 
-Decrypts BLE advertisements, publishes MQTT JSON, and opens short GATT sessions for **daily history (up to 30 days)** and PV registers.
+Decrypts BLE advertisements, publishes MQTT JSON, and opens short GATT sessions for history and PV registers.
 
 Built with [SuperGrok](https://grok.com) / Grokbot from captured ADV / GATT packets and Feather serial logs. Not an official Victron SDK.
 
