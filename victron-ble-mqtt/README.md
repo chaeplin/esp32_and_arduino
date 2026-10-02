@@ -101,6 +101,10 @@ Victron 은 history 의 하루를 **자정이 아니라 저녁에 PV 가 꺼진 
 - 상태 파일: `victron_days.json`, `victron_status_hist.json`, `victron_live_hist.json`, `victron_pv.json`, `victron_board_24h.jsonl` (모두 git 제외)
 - InfluxDB 측정값 이름은 `victron_mppt`, `victron_sense` 를 가정 (MQTT → Influx 적재는 별도, 예: Telegraf)
 
+| dashboard | esp32 status |
+|---|---|
+| <img src="dashboard.png" width="360" alt="dashboard"> | <img src="dashboard-status.png" width="360" alt="dashboard-status">
+
 ## 메모
 
 - **배터리**: ADV 를 100 % duty·5개/6 s 로 바꿔 매 분 깨어 있는 시간이 ~9.7 s → 4~5 s 로 줄었습니다 (깨어 있는 동안의 에너지 약 절반).
