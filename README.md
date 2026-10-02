@@ -2,8 +2,6 @@
 
 ESP32 / Arduino sketches and local bridges. More projects will be added as folders under this repo.
 
-Korean: [README.ko.md](README.ko.md)
-
 ## Projects
 
 <table>
