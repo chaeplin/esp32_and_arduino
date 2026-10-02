@@ -93,14 +93,13 @@ Victron 은 history 의 하루를 **자정이 아니라 저녁에 PV 가 꺼진 
 
 ## 뷰어
 
-- `/` — 실시간 값, 오늘/어제 요약, 31일 history 표(충전단계 막대, 수율, Pmax, Vpv, 배터리 최대/최소, Ibat, 소비, 오류), InfluxDB 가 있으면 차트
-- 보드 패널 (WiFi / MPPT BLE / Sense BLE / 보드 V): 수신한 `victron/status` 의 최근 1h ↔ 24h(클릭) 현재·최소·최대. RSSI 0 과 0 V 는 "값 없음" 으로 제외
+- `/` — 실시간 값, 오늘/어제 요약, 일별 그래프, InfluxDB 가 있으면 차트
+- 작은 그래프(스파크라인): 바뀌는 값 — 오늘 수확 ADV, GATT PV(W + V), 부하 ADV(W, 마우스를 올리면 A 도), WiFi / MPPT BLE / Sense BLE RSSI, 보드 V — 는 현재 값 옆에 그래프로 표시. 기간은 보드 패널의 "최근 1h ↔ 24h"(클릭)을 따르고, 모서리에 ↓최소 ↑최대, 마우스/터치로 그 시각 값. RSSI·보드 V 는 수신한 `victron/status` 기록, ADV/GATT 값은 뷰어가 MQTT 에서 모은 24 h 기록(`victron_live_hist.json`, 비어 있고 Influx 가 설정돼 있으면 시작할 때 Influx 에서 채움). RSSI 0 과 0 V 는 "값 없음" 으로 제외. 어제 값(수확/소비/최대 P/최대 Vpv)은 확정값이라 숫자만
+- 일별 그래프 (최근 15/30일, 일별 표 대신): 수율/소비 Wh, 최대 P, 최대 Vpv, 배터리 최대/최소, 최대 Ibat, 충전단계 분(벌크/흡수/플로트) — seq 기준 일별 기록, 기록 없는 날은 빈칸, 오늘은 진행 중 표시, 오류 날 ▼. 그래프에 마우스를 올리면 그날 값(단위 포함), 충전단계 시간과 비율, 오류 코드 4개 표시
 - `/status` — `victron/status` 그래프 (RSSI 0 / 0 V 점 제외, 보드 전압, Wi-Fi/BLE RSSI, 깨어 있던 시간 등, 최근 24 h)
-- API: `/state` (전체 상태 + `days` + `dev_ymd`), `/days`, `/hist?range=12h|24h|48h|1w|1m|all` (Influx), `/api/status_hist?range=1h|6h|24h`
-- 상태 파일: `victron_days.json`, `victron_status_hist.json`, `victron_pv.json`, `victron_board_24h.jsonl` (모두 git 제외)
+- API: `/state` (전체 상태 + `days` + `dev_ymd`), `/days`, `/hist?range=12h|24h|48h|1w|1m|all` (Influx), `/api/status_hist?range=1h|6h|24h`, `/api/spark?range=1h|24h`
+- 상태 파일: `victron_days.json`, `victron_status_hist.json`, `victron_live_hist.json`, `victron_pv.json`, `victron_board_24h.jsonl` (모두 git 제외)
 - InfluxDB 측정값 이름은 `victron_mppt`, `victron_sense` 를 가정 (MQTT → Influx 적재는 별도, 예: Telegraf)
-
-| <img src="dashboard.png" width="360" alt="dashboard"> | <img src="dashboard-status.png" width="360" alt="dashboard-status"> |
 
 ## 메모
 

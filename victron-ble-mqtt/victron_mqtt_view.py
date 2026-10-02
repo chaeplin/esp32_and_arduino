@@ -600,6 +600,177 @@ def _status_hist(key: str) -> dict[str, Any]:
 _load_status_hist()
 
 
+# ---- statuspage6: live ADV / GATT ring buffer (main-page sparklines), persisted like the status one ----
+LIVE_HIST_FILE = HERE / "victron_live_hist.json"
+LIVE_KEEP = 24 * 3600
+LIVE_MAX = 6000
+LIVE_MIN_DT = 20.0                 # per topic; the board publishes about once a minute
+SPARK_RANGES: dict[str, float] = {"1h": 3600, "24h": 24 * 3600}
+SPARK_PTS = 240                    # max points per series sent to the page (time-bucket mean)
+_live_q: deque[dict] = deque()
+_live_lock = threading.Lock()
+_live_saved = 0.0
+_live_last: dict[str, float] = {}
+
+
+def _num(v: Any) -> float | None:
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if (x == x and x not in (float("inf"), float("-inf"))) else None
+
+
+def _live_fields(kind: str, obj: dict[str, Any]) -> dict[str, float]:
+    d: dict[str, float] = {}
+    if kind == "m":                                    # victron/mppt (ADV)
+        y = _num(obj.get("yield_wh"))
+        if y is None and _num(obj.get("yield_kwh")) is not None:
+            y = _num(obj.get("yield_kwh")) * 1000.0
+        if y is not None and y >= 0:
+            d["yield"] = round(y, 1)
+        la, vb = _num(obj.get("load_a")), _num(obj.get("vbat"))
+        if la is not None and la >= 0:
+            d["load_a"] = round(la, 3)
+            if vb is not None and vb > 0.5:
+                d["load_w"] = round(la * vb, 2)
+    else:                                              # victron/mppt/pv (GATT)
+        vpv, ppv = _num(obj.get("vpv")), _num(obj.get("ppv"))
+        if vpv is not None and vpv >= 0:
+            d["vpv"] = round(vpv, 2)
+        if ppv is not None and ppv >= 0:
+            d["ppv"] = round(ppv, 2)
+    return d
+
+
+def _load_live_hist() -> None:
+    if not LIVE_HIST_FILE.is_file():
+        return
+    cut = time.time() - LIVE_KEEP
+    try:
+        obj = json.loads(LIVE_HIST_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    pts = obj.get("pts") if isinstance(obj, dict) else None
+    if not isinstance(pts, list):
+        return
+    with _live_lock:
+        for p in pts:
+            if isinstance(p, dict) and isinstance(p.get("rx"), (int, float)) and p["rx"] >= cut \
+                    and isinstance(p.get("d"), dict):
+                d = {k: v for k, v in p["d"].items() if _num(v) is not None}
+                if d:
+                    _live_q.append({"rx": float(p["rx"]), "d": d})
+        while len(_live_q) > LIVE_MAX:
+            _live_q.popleft()
+
+
+def _save_live_hist() -> None:
+    global _live_saved
+    with _live_lock:
+        pts = list(_live_q)
+    try:
+        tmp = LIVE_HIST_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"v": 1, "pts": pts}, separators=(",", ":")), encoding="utf-8")
+        tmp.replace(LIVE_HIST_FILE)
+        _live_saved = time.time()
+    except OSError:
+        pass
+
+
+def _push_live(kind: str, obj: Any, now: float) -> None:
+    if not isinstance(obj, dict):
+        return
+    if now - _live_last.get(kind, 0.0) < LIVE_MIN_DT:
+        return
+    d = _live_fields(kind, obj)
+    if not d:
+        return
+    _live_last[kind] = now
+    with _live_lock:
+        _live_q.append({"rx": now, "d": d})
+        cut = now - LIVE_KEEP
+        while _live_q and (_live_q[0]["rx"] < cut or len(_live_q) > LIVE_MAX):
+            _live_q.popleft()
+        n = len(_live_q)
+    if n % 10 == 0 or now - _live_saved > 300:
+        _save_live_hist()
+
+
+def _live_backfill() -> None:
+    """one-time: if the local buffer is empty and Influx is configured, seed yield/load from it"""
+    with _live_lock:
+        if _live_q:
+            return
+    try:
+        if not _influx_token():
+            return
+        q = f'''
+from(bucket: "{INFLUX_BUCKET}")
+  |> range(start: -{LIVE_KEEP}s)
+  |> filter(fn: (r) => r._measurement == "victron_mppt" and
+       (r._field == "yield_wh" or r._field == "load_a" or r._field == "vbat"))
+  |> aggregateWindow(every: 2m, fn: mean, createEmpty: false)
+  |> keep(columns: ["_time","_value","_field"])
+'''
+        rows = _flux_csv(q)
+    except Exception:
+        return
+    by: dict[float, dict[str, Any]] = {}
+    for fld in ("yield_wh", "load_a", "vbat"):
+        for t, v in _series(rows, fld):
+            by.setdefault(round(float(t), 0), {})[fld] = v
+    pts = []
+    for t in sorted(by):
+        d = _live_fields("m", by[t])
+        if d:
+            pts.append({"rx": t, "d": d})
+    with _live_lock:
+        if _live_q or not pts:
+            return
+        _live_q.extend(pts[-LIVE_MAX:])
+    _save_live_hist()
+
+
+def _bucket(pts: list[list[float]], t0: float, span: float, nb: int) -> list[list[float]]:
+    if len(pts) <= nb:
+        return [[round(t, 1), round(v, 3)] for t, v in pts]
+    w = span / nb
+    acc: dict[int, list[float]] = {}
+    for t, v in pts:
+        a = acc.setdefault(int((t - t0) // w), [0.0, 0.0, 0])
+        a[0] += t; a[1] += v; a[2] += 1
+    return [[round(a[0] / a[2], 1), round(a[1] / a[2], 3)] for _, a in sorted(acc.items())]
+
+
+def _spark(key: str) -> dict[str, Any]:
+    """main-page sparklines: ADV/GATT from the live ring, RSSI / board V from the received
+    victron/status history (same source as /status and the board min/max); 0/null excluded"""
+    span = SPARK_RANGES.get(key, 3600)
+    now = time.time()
+    t0 = now - span
+    with _live_lock:
+        lp = [p for p in _live_q if p["rx"] >= t0]
+    with _status_lock:
+        sp = [p for p in _status_q if p["rx"] >= t0]
+    ser: dict[str, list[list[float]]] = {}
+    for name in ("yield", "load_a", "load_w", "vpv", "ppv"):
+        ser[name] = [[p["rx"], float(p["d"][name])] for p in lp if _num(p["d"].get(name)) is not None]
+    for name, field in MM_FIELDS:
+        ser[name] = [[p["rx"], float(p["d"][field])] for p in sp if _sig_ok(field, p["d"].get(field))]
+    out: dict[str, Any] = {}
+    for name, pts in ser.items():
+        vals = [v for _, v in pts]
+        out[name] = {"n": len(pts), "min": min(vals) if vals else None, "max": max(vals) if vals else None,
+                     "last": pts[-1] if pts else None, "p": _bucket(pts, t0, span, SPARK_PTS)}
+    return {"range": key, "t0": t0, "t1": now, "s": out}
+
+
+_load_live_hist()
+
+
 def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
@@ -1025,6 +1196,7 @@ def _on_message_impl(_c, _u, msg: mqtt.MQTTMessage) -> None:
         if msg.topic == TOPIC_MPPT:
             obj["_ts"] = _ts()
             state["mppt"] = obj
+            _push_live("m", obj, now)
         elif msg.topic == TOPIC_SENSE:
             obj["_ts"] = _ts()
             state["sense"] = obj
@@ -1052,6 +1224,7 @@ def _on_message_impl(_c, _u, msg: mqtt.MQTTMessage) -> None:
         elif msg.topic == TOPIC_PV:
             obj["_ts"] = _ts()
             state["pv"] = obj
+            _push_live("p", obj, now)
         state["updated"] = now
 
 
@@ -1124,38 +1297,33 @@ h1 { font-size:20px; margin:0; font-weight:700; }
 .row:last-child { border-bottom:0; }
 .k { color:#8aa0b3; } .v { font-variant-numeric:tabular-nums; font-weight:700; }
 .ok { color:#6f6; } .bad { color:#f66; }
-table.mm { width:100%; border-collapse:collapse; font-size:14px; }
-table.mm th, table.mm td { padding:6px 4px; text-align:right; font-variant-numeric:tabular-nums; }
-table.mm th { color:#8aa0b3; font-weight:600; }
-table.mm td:first-child, table.mm th:first-child { text-align:left; color:#8aa0b3; font-weight:500; }
-table.mm td { font-weight:700; }
-.matwrap { overflow-x:auto; margin-top:12px; background:#1c2b3a; border-radius:12px; padding:8px; }
-table.mat { width:100%; border-collapse:collapse; font-size:12px; min-width:720px; }
-table.mat th, table.mat td { padding:5px 4px; text-align:right; white-space:nowrap; vertical-align:bottom; }
-table.mat th:first-child, table.mat td:first-child { text-align:left; color:#8aa0b3; position:sticky; left:0; background:#1c2b3a; }
-table.mat th { color:#c5d4e0; font-weight:700; }
-table.mat .on { background:#243646; }
-.stcell { position:relative; display:flex; justify-content:center; overflow:visible; }
-.stcell:hover .sttip { display:block; }
-.stcell.flip .sttip { left:auto; right:calc(50% + 16px); }
-.sttip {
-  display:none; position:absolute; left:calc(50% + 16px); bottom:12px;
-  transform:none; z-index:8;
-  background:#1a2733; border:1px solid #5b8fb8; border-radius:8px;
-  padding:6px 8px; font-size:11px; line-height:1.45; white-space:nowrap;
-  color:#e8eef4; box-shadow:0 6px 16px rgba(0,0,0,.35); pointer-events:none;
+/* statuspage6: inline sparklines (label | chart | current value) */
+.srow { display:grid; grid-template-columns:var(--kw,110px) minmax(60px,1fr) var(--vw,auto); align-items:center; gap:10px;
+        padding:4px 0; border-bottom:1px solid #2a3b4d; font-size:15px; }
+.srow:last-child { border-bottom:0; }
+.srow canvas.spk { width:100%; height:40px; display:block; cursor:crosshair; touch-action:pan-y; }
+.srow .v { text-align:right; white-space:nowrap; }
+@media (max-width: 520px) {
+  .srow { grid-template-columns:1fr auto; grid-template-areas:"k v" "c c"; row-gap:2px; }
+  .srow .k { grid-area:k; } .srow .v { grid-area:v; } .srow canvas.spk { grid-area:c; height:36px; }
 }
-.sttip b { font-variant-numeric:tabular-nums; }
-.sttrack { height:120px; display:flex; align-items:flex-end; justify-content:center; position:relative; }
-.stbar { width:28px; min-height:3px; display:flex; flex-direction:column-reverse; background:#243646; border-radius:3px 3px 0 0; overflow:hidden; }
-.stbar.empty { background:#1a2733; }
-.stbar .stb { background:#d9dde2; width:100%; }
-.stbar .sta { background:#9eb4c7; width:100%; }
-.stbar .stf { background:#5b8fb8; width:100%; }
-.stpct { display:block; font-size:10px; font-weight:600; color:#8aa0b3; }
-.hint { color:#6d8296; font-size:12px; padding:8px 4px 0; }
+/* per-day charts (same canvas style as /status) */
+.dcwrap { margin-top:12px; background:#1c2b3a; border-radius:12px; padding:8px 10px 10px; }
+.dchead { display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:6px; }
+.dchead button { font-size:12px; padding:3px 10px; border-radius:999px; cursor:pointer; color:#8aa0b3;
+  background:#14202c; border:1px solid #2a3b4d; font-family:ui-monospace,Menlo,monospace; }
+.dchead button.on { color:#fff; background:#0e4a44; border-color:#00b3a4; font-weight:700; }
+.dchead button:disabled { opacity:.35; cursor:default; }
+.dcgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:10px; }
+.dcard { background:#15202b; border-radius:10px; padding:6px 8px 4px; }
+.dct { display:flex; justify-content:space-between; gap:6px; font-size:13px; color:#8aa0b3; min-height:17px; }
+.dch { min-height:30px; font-size:11px; line-height:1.35; color:#c5d4e0; font-variant-numeric:tabular-nums; padding:2px 0 0; }
+.dch .e { color:#ff5d5d; font-weight:700; }
+.dcard canvas { width:100%; height:130px; display:block; }
+.dclg { font-size:11px; color:#6d8296; }
+.dclg i { display:inline-block; width:9px; height:9px; border-radius:2px; margin:0 3px 0 8px; vertical-align:-1px; }
 body.only-days header, body.only-days .grid { display:none !important; }
-body.only-days .matwrap { margin:0; border-radius:0; min-height:100dvh; }
+body.only-days .dcwrap { margin:0; border-radius:0; min-height:100dvh; }
 @media (max-width: 820px) {
   .side { grid-template-columns: 1fr; }
   .side { grid-template-columns: 1fr; }
@@ -1196,31 +1364,29 @@ body.only-days .matwrap { margin:0; border-radius:0; min-height:100dvh; }
       <div class="states" id="states"></div>
     </div>
     <div class="side" id="side">
-      <div class="card">
-        <div class="row"><span class="k">오늘 수확 ADV</span><span class="v" id="y_td">—</span></div>
+      <div class="card" style="--kw:110px;--vw:9.2em">
+        <div class="srow"><span class="k">오늘 수확 ADV</span><canvas class="spk" data-sp="yield"></canvas><span class="v" id="y_td">—</span></div>
         <div class="row"><span class="k">어제 수확</span><span class="v" id="y_yd">—</span></div>
         <div class="row"><span class="k">어제 소비</span><span class="v" id="c_yd">—</span></div>
         <div class="row"><span class="k">어제 최대 P</span><span class="v" id="p_yd">—</span></div>
         <div class="row"><span class="k">어제 최대 Vpv</span><span class="v" id="v_yd">—</span></div>
-        <div class="row"><span class="k">GATT PV</span><span class="v" id="gatt_pv">—</span></div>
-        <div class="row"><span class="k">부하 ADV</span><span class="v" id="load_row">—</span></div>
+        <div class="srow"><span class="k">GATT PV</span><canvas class="spk" data-sp="pv"></canvas><span class="v" id="gatt_pv">—</span></div>
+        <div class="srow"><span class="k">부하 ADV</span><canvas class="spk" data-sp="load"></canvas><span class="v" id="load_row">—</span></div>
       </div>
-      <div class="card">
-        <div class="row" style="border:0;padding-bottom:4px"><span class="k">보드</span><span class="k" id="mmwin" style="cursor:pointer" title="최소/최대 기간 = 수신한 victron/status (클릭: 1h ↔ 24h). RSSI 0 / 0 V 는 제외">최근 1h</span></div>
-        <table class="mm">
-          <tr><th></th><th>현재</th><th>최소</th><th>최대</th></tr>
-          <tr><td>WiFi</td><td id="w_now">—</td><td id="w_min">—</td><td id="w_max">—</td></tr>
-          <tr><td>MPPT BLE</td><td id="m_now">—</td><td id="m_min">—</td><td id="m_max">—</td></tr>
-          <tr><td>Sense BLE</td><td id="s_now">—</td><td id="s_min">—</td><td id="s_max">—</td></tr>
-          <tr><td>보드 V</td><td id="bv_now">—</td><td id="bv_min">—</td><td id="bv_max">—</td></tr>
-        </table>
+      <div class="card" style="--kw:84px;--vw:5.6em">
+        <div class="row" style="border:0;padding-bottom:4px"><span class="k">보드</span><span class="k" id="mmwin" style="cursor:pointer" title="그래프 기간 (보드 + 왼쪽 오늘 수확 / GATT PV / 부하). 클릭: 1h ↔ 24h. 모서리 ↓최소 ↑최대. RSSI 0 / 0 V 는 제외">최근 1h</span></div>
+        <div class="srow"><span class="k">WiFi</span><canvas class="spk" data-sp="wifi"></canvas><span class="v" id="w_now">—</span></div>
+        <div class="srow"><span class="k">MPPT BLE</span><canvas class="spk" data-sp="mppt"></canvas><span class="v" id="m_now">—</span></div>
+        <div class="srow"><span class="k">Sense BLE</span><canvas class="spk" data-sp="sense"></canvas><span class="v" id="s_now">—</span></div>
+        <div class="srow"><span class="k">보드 V</span><canvas class="spk" data-sp="board"></canvas><span class="v" id="bv_now">—</span></div>
       </div>
     </div>
   </div>
-  <div class="matwrap" id="daymat"></div>
-  <div class="hint">최근 15일 · 막대에 올리면 벌크/흡수/플로트 시간과 비율. 오류 0,0,0,0 은 0.</div>
-  <div class="matwrap" id="daymat2"></div>
-  <div class="hint">그 이전 15일 (day16–30). 오류 0,0,0,0 은 0, 난 코드만 표시.</div>
+  <div class="dcwrap" id="dchart">
+    <div class="dchead"><span class="k">일별 그래프 <span class="dclg">· 오래된 날 → 최근 · 점선/흐림 = 오늘(진행 중) · 빨간 ▼ = 오류 · 그래프에 올리면 그날 값</span></span>
+      <span><button data-n="15">15일</button> <button data-n="30">30일</button></span></div>
+    <div class="dcgrid" id="dcgrid"></div>
+  </div>
 </div>
 <script>
 if (new URLSearchParams(location.search).get('only')==='days') document.body.classList.add('only-days');
@@ -1274,18 +1440,16 @@ function mm(arr){
 }
 /* statuspage3: panel values come from the server (received victron/status history, same as /status) */
 let MMWIN = localStorage.getItem('mm_win') || '1h';
-function setMM(id, o, dp){
+function setMM(id, o, dp, u){
   o = o || {};
-  document.getElementById(id+'_now').textContent = f(o.now, dp, '');
-  document.getElementById(id+'_min').textContent = f(o.min, dp, '');
-  document.getElementById(id+'_max').textContent = f(o.max, dp, '');
+  document.getElementById(id+'_now').textContent = f(o.now, dp, u||'');   /* min/max: sparkline corner */
 }
 function showMM(s){
   const el = document.getElementById('mmwin');
   if (el) el.textContent = '최근 ' + MMWIN;
   const bm = (s && s.board_mm) ? s.board_mm[MMWIN] : null;
   if (!bm) return;
-  setMM('w', bm.wifi, 0); setMM('m', bm.mppt, 0); setMM('s', bm.sense, 0); setMM('bv', bm.board, 2);
+  setMM('w', bm.wifi, 0, ' dBm'); setMM('m', bm.mppt, 0, ' dBm'); setMM('s', bm.sense, 0, ' dBm'); setMM('bv', bm.board, 2, ' V');
 }
 let LAST_STATE = null;
 (function(){
@@ -1294,8 +1458,115 @@ let LAST_STATE = null;
     MMWIN = (MMWIN === '1h') ? '24h' : '1h';
     localStorage.setItem('mm_win', MMWIN);
     showMM(LAST_STATE);
+    loadSpark();
   });
 })();
+/* ---- statuspage6: sparklines (server history; range = MMWIN; 0/null already dropped server-side) ---- */
+const SP_SPECS = {
+  yield: [{k:'yield',  c:'#00b3a4', u:' Wh',  dp:0, fill:true}],
+  pv:    [{k:'ppv',    c:'#f0b44c', u:' W',   dp:1, fill:true}, {k:'vpv', c:'#c792ea', u:' V', dp:2}],
+  load:  [{k:'load_w', c:'#6ec1ff', u:' W',   dp:1, fill:true}, {k:'load_a', c:'#9eb4c7', u:' A', dp:2, hide:true}],
+  wifi:  [{k:'wifi',   c:'#6ec1ff', u:' dBm', dp:0}],
+  mppt:  [{k:'mppt',   c:'#00b3a4', u:' dBm', dp:0}],
+  sense: [{k:'sense',  c:'#c792ea', u:' dBm', dp:0}],
+  board: [{k:'board',  c:'#f0b44c', u:' V',   dp:2, fill:true}],
+};
+let SPARK = null;
+function spSer(k){ return (SPARK && SPARK.s && SPARK.s[k]) || {p:[], min:null, max:null}; }
+function spGap(p){                          /* break the line on a gap > 3x median step (min 3 min) */
+  if (p.length < 3) return 600;
+  const d = []; for (let i=1;i<p.length;i++) d.push(p[i][0]-p[i-1][0]);
+  d.sort((a,b) => a-b); return Math.max(180, 3*d[d.length>>1]);
+}
+function spNear(p, t){
+  let lo=0, hi=p.length-1; if (hi < 0) return -1;
+  while (hi-lo > 1){ const m=(lo+hi)>>1; if (p[m][0] < t) lo=m; else hi=m; }
+  return Math.abs(p[lo][0]-t) <= Math.abs(p[hi][0]-t) ? lo : hi;
+}
+function spTime(t){ return new Date(t*1000).toLocaleTimeString('ko-KR',{timeZone:'Asia/Seoul',hour12:false,hour:'2-digit',minute:'2-digit'}); }
+function drawSpark(cv, hx){
+  const specs = SP_SPECS[cv.dataset.sp]; if (!specs) return;
+  const dpr = window.devicePixelRatio||1, W = cv.clientWidth, H = cv.clientHeight;
+  if (!W || !H) return;
+  cv.width = Math.round(W*dpr); cv.height = Math.round(H*dpr);
+  const g = cv.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,W,H);
+  const L=1, R=3, T=12, B=3, pw=W-L-R, ph=H-T-B;
+  const t1 = SPARK ? SPARK.t1 : Date.now()/1000, t0 = SPARK ? SPARK.t0 : t1-3600;
+  const X = t => L + (t-t0)/(t1-t0)*pw;
+  g.strokeStyle='#22323f'; g.lineWidth=1; g.beginPath(); g.moveTo(L, T+ph+.5); g.lineTo(L+pw, T+ph+.5); g.stroke();
+  g.font='9px ui-monospace,Menlo,monospace';
+  const mainS = spSer(specs[0].k);
+  if (!mainS.p.length){ g.fillStyle='#4f6378'; g.textAlign='center'; g.fillText('기록 없음', L+pw/2, T+ph/2+3); return; }
+  const ys = {};
+  specs.forEach(s => {
+    const S = spSer(s.k), p = S.p; if (!p.length) return;
+    let lo = Infinity, hi = -Infinity; p.forEach(q => { if (q[1]<lo) lo=q[1]; if (q[1]>hi) hi=q[1]; });
+    if (hi-lo < 1e-9){ hi += 0.5; lo -= 0.5; }
+    const pad = (hi-lo)*0.08; lo -= pad; hi += pad;
+    const Y = v => T + (hi-v)/(hi-lo)*ph;
+    ys[s.k] = Y;
+    if (s.hide) return;
+    const gap = spGap(p);
+    let run = [];
+    const flush = () => {
+      if (!run.length) return;
+      if (s.fill && run.length > 1){
+        g.globalAlpha=0.16; g.fillStyle=s.c; g.beginPath(); g.moveTo(X(run[0][0]), T+ph);
+        run.forEach(q => g.lineTo(X(q[0]), Y(q[1]))); g.lineTo(X(run[run.length-1][0]), T+ph); g.closePath(); g.fill(); g.globalAlpha=1;
+      }
+      g.strokeStyle=s.c; g.lineWidth=1.3; g.beginPath();
+      run.forEach((q,i) => i ? g.lineTo(X(q[0]), Y(q[1])) : g.moveTo(X(q[0]), Y(q[1]))); g.stroke();
+      if (run.length===1){ g.fillStyle=s.c; g.fillRect(X(run[0][0])-1, Y(run[0][1])-1, 2.5, 2.5); }
+      run = [];
+    };
+    p.forEach((q,i) => { if (i && q[0]-p[i-1][0] > gap) flush(); run.push(q); }); flush();
+    const lq = p[p.length-1]; g.fillStyle=s.c; g.beginPath(); g.arc(X(lq[0]), Y(lq[1]), 2, 0, 7); g.fill();
+  });
+  const s0 = specs[0];
+  if (hx==null){                            /* corner: min / max of the whole range */
+    g.fillStyle='#6d8296'; g.textAlign='right';
+    g.fillText('↓'+f(mainS.min, s0.dp, '')+' ↑'+f(mainS.max, s0.dp, ''), L+pw, 9);
+    return;
+  }
+  const gapM = spGap(mainS.p);
+  const t = t0 + (hx-L)/pw*(t1-t0);
+  const i0 = spNear(mainS.p, t);
+  let txt;
+  if (i0 < 0 || Math.abs(mainS.p[i0][0]-t) > gapM/2){ txt = spTime(t) + ' 기록 없음'; hx = Math.max(L, Math.min(L+pw, hx)); }
+  else {
+    const tq = mainS.p[i0][0]; hx = X(tq);
+    g.strokeStyle='#8aa0b3'; g.setLineDash([2,2]); g.beginPath(); g.moveTo(hx+.5, T); g.lineTo(hx+.5, T+ph); g.stroke(); g.setLineDash([]);
+    const parts = [spTime(tq)];
+    specs.forEach(s => {
+      const p = spSer(s.k).p, j = spNear(p, tq);
+      if (j < 0 || Math.abs(p[j][0]-tq) > gapM/2) return;
+      parts.push(f(p[j][1], s.dp, s.u));
+      if (!s.hide && ys[s.k]){ g.fillStyle=s.c; g.beginPath(); g.arc(hx, ys[s.k](p[j][1]), 2.6, 0, 7); g.fill(); }
+    });
+    txt = parts.join(' · ');
+  }
+  g.font='10px ui-monospace,Menlo,monospace';
+  const tw = g.measureText(txt).width;
+  let tx = hx + 6; if (tx + tw > L+pw) tx = Math.max(L, hx - 6 - tw);
+  g.fillStyle='rgba(21,32,43,0.88)'; g.fillRect(tx-2, 0, tw+4, 11);
+  g.fillStyle='#e8eef4'; g.textAlign='left'; g.fillText(txt, tx, 9);
+}
+function drawSparks(){ document.querySelectorAll('canvas.spk').forEach(cv => drawSpark(cv, cv._hx==null ? null : cv._hx)); }
+document.querySelectorAll('canvas.spk').forEach(cv => {
+  const at = x => { cv._hx = x; drawSpark(cv, x); };
+  const off = () => { cv._hx = null; drawSpark(cv, null); };
+  const tx = e => e.touches[0].clientX - cv.getBoundingClientRect().left;
+  cv.addEventListener('mousemove', e => at(e.offsetX));
+  cv.addEventListener('mouseleave', off);
+  cv.addEventListener('touchstart', e => at(tx(e)), {passive:true});
+  cv.addEventListener('touchmove', e => at(tx(e)), {passive:true});
+  cv.addEventListener('touchend', () => setTimeout(off, 1500));
+});
+async function loadSpark(){
+  const r = await getJson('/api/spark?range='+MMWIN, 5000);
+  if (r && r.s){ SPARK = r; drawSparks(); }
+}
+window.addEventListener('resize', drawSparks);
 function set3(id, cur, arr, dp){
   document.getElementById(id+'_now').textContent = f(cur, dp, '');
   const r = mm(arr);
@@ -1325,14 +1596,6 @@ function devToday(){
   const d = DEV ? String(DEV) : '';
   return (d && (d===w || ymdPrev(d)===w || ymdPrev(w)===d)) ? d : w;
 }
-function lab(ymd){
-  if (!ymd) return '';
-  const keys = ymdList();
-  if (String(ymd)===devToday() && String(ymd) > String(keys[0])) return '새 날';
-  if (String(ymd)===String(keys[0])) return '오늘';
-  if (String(ymd)===String(keys[1])) return '어제';
-  return String(ymd).slice(4,6)+'/'+String(ymd).slice(6,8);
-}
 function recOf(ymd){
   const key = String(ymd);
   const stored = DAYS.find(d => String(d.ymd)===key || String(d.day)===key) || {};
@@ -1353,15 +1616,6 @@ function recOf(ymd){
   if (vbm!=null) out.vbat_min = vbm;
   return out;
 }
-function errTxt(v){
-  let arr = [];
-  if (v==null || v==='') return '0';
-  if (Array.isArray(v)) arr = v.map(Number);
-  else if (typeof v === 'string') arr = v.split(/[,\s]+/).map(Number);
-  else arr = [Number(v)];
-  const nz = arr.filter(x => Number.isFinite(x) && x !== 0);
-  return nz.length ? nz.join(',') : '0';
-}
 function fmtMin(m){
   if (m==null || m==='') return '—';
   m = Number(m);
@@ -1370,96 +1624,198 @@ function fmtMin(m){
   const h = Math.floor(m/60), r = Math.round(m % 60);
   return r ? (h + '시간 ' + r + '분') : (h + '시간');
 }
-function stageParts(d){
-  const b = Number(d.bulk_min), a = Number(d.abs_min), fl = Number(d.float_min);
-  const bb = Number.isFinite(b) ? b : 0;
-  const aa = Number.isFinite(a) ? a : 0;
-  const ff = Number.isFinite(fl) ? fl : 0;
-  const t = bb + aa + ff;
-  return {b:bb, a:aa, f:ff, t:t};
+
+/* ---- per-day charts (recOf = seq-aware day records + live today) ---- */
+const DC_SPECS = [
+  {id:'yc', title:'수율 / 소비 Wh', unit:' Wh', dp:0, zero:true, series:[
+    {name:'수율', color:'#00b3a4', type:'bar', get:d => d.yield_kwh!=null ? d.yield_kwh*1000 : null},
+    {name:'소비', color:'#f0b44c', type:'bar', get:d => d.consumed_kwh!=null ? d.consumed_kwh*1000 : null}]},
+  {id:'pm', title:'최대 P W', unit:' W', dp:0, zero:true, series:[
+    {name:'Pmax', color:'#6ec1ff', type:'bar', get:d => d.pmax_w}]},
+  {id:'vp', title:'최대 Vpv V', unit:' V', dp:2, series:[
+    {name:'Vpv', color:'#c792ea', type:'line', get:d => d.vpv_max}]},
+  {id:'vb', title:'배터리 최대 / 최소 V', unit:' V', dp:2, band:true, series:[
+    {name:'최대', color:'#00b3a4', type:'line', get:d => d.vbat_max},
+    {name:'최소', color:'#5b8fb8', type:'line', get:d => d.vbat_min}]},
+  {id:'ib', title:'최대 Ibat A', unit:' A', dp:1, zero:true, series:[
+    {name:'Ibat', color:'#9eb4c7', type:'bar', get:d => d.ibat_max}]},
+  {id:'st', title:'충전단계 분 (벌크/흡수/플로트)', dp:0, zero:true, stacked:true, series:[
+    {name:'벌크', color:'#d9dde2', type:'bar', get:d => d.bulk_min},
+    {name:'흡수', color:'#9eb4c7', type:'bar', get:d => d.abs_min},
+    {name:'플로트', color:'#5b8fb8', type:'bar', get:d => d.float_min}]},
+];
+let DC_N = Number(localStorage.getItem('dc_n') || 15);
+function dcNum(v){ if (v==null || v==='') return null; const x = Number(v); return Number.isFinite(x) ? x : null; }
+function dcHasRec(d){
+  return ['yield_kwh','consumed_kwh','pmax_w','vpv_max','vbat_max','vbat_min','ibat_max','bulk_min'].some(k => dcNum(d[k])!=null);
 }
-function stageBar(d, flip){
-  const s = stageParts(d);
-  const y = (d.yield_kwh!=null) ? Number(d.yield_kwh)*1000 : 0;
-  const h = Math.max((s.t || y) ? 8 : 3, Math.min(100, (y/250)*100));
-  if (!s.t) return '<div class="stcell"><div class="sttrack"><div class="stbar empty" style="height:'+h+'%"></div></div></div>';
-  const tip = '<div>벌크충전 <b>'+fmtMin(s.b)+'</b> '+Math.round(100*s.b/s.t)+'%</div>'
-            + '<div>흡수충전 <b>'+fmtMin(s.a)+'</b> '+Math.round(100*s.a/s.t)+'%</div>'
-            + '<div>플로트 <b>'+fmtMin(s.f)+'</b> '+Math.round(100*s.f/s.t)+'%</div>';
-  return '<div class="stcell'+(flip?' flip':'')+'">'
-    + '<div class="sttrack"><div class="stbar" style="height:'+h+'%">'
-    + '<span class="stb" style="height:'+(100*s.b/s.t).toFixed(1)+'%"></span>'
-    + '<span class="sta" style="height:'+(100*s.a/s.t).toFixed(1)+'%"></span>'
-    + '<span class="stf" style="height:'+(100*s.f/s.t).toFixed(1)+'%"></span>'
-    + '</div></div>'
-    + '<div class="sttip">'+tip+'</div>'
-    + '</div>';
+function dcErr(d){
+  let a = d.err; if (a==null || a==='') return null;
+  if (!Array.isArray(a)) a = String(a).split(/[,\s]+/);
+  a = a.map(Number).filter(x => Number.isFinite(x));
+  return a.some(x => x !== 0) ? a.join(',') : null;   /* all 4 codes (day0..), only when any != 0 */
 }
-function matTable(keys){
-  const today = ymdList()[0];
-  const yest = ymdList()[1];
-  const dev = devToday();
-  const rows = [
-    ['충전단계', (d, i, n) => stageBar(d, i >= n - 3), 'html'],
-    ['수율 Wh', d => (d.yield_kwh!=null?d.yield_kwh*1000:null), 0],
-    ['최대 P W', d => d.pmax_w, 0],
-    ['최대 Vpv', d => d.vpv_max, 2],
-    ['배터리 최대', d => d.vbat_max, 2],
-    ['배터리 최소', d => d.vbat_min, 2],
-    ['최대 Ibat', d => d.ibat_max, 1],
-    ['소비 Wh', d => (d.consumed_kwh!=null?d.consumed_kwh*1000:null), 0],
-    ['오류', d => d.err, 'err'],
-  ];
-  let th = '<tr><th></th>';
-  keys.forEach(k => {
-    const on = (k===today||k===yest||k===dev) ? ' class="on"' : '';
-    th += '<th'+on+'>'+lab(k)+'</th>';
-  });
-  th += '</tr>';
-  let body = '';
-  rows.forEach(([name, get, dp]) => {
-    body += '<tr><td>'+name+'</td>';
-    keys.forEach((k, i) => {
-      const rec = recOf(k);
-      const v = (dp==='html') ? get(rec, i, keys.length) : get(rec);
-      const on = (k===today||k===yest||k===dev) ? ' class="on"' : '';
-      let txt;
-      if (dp==='html') txt = v;
-      else if (dp==='err') txt = errTxt(v);
-      else txt = f(v, dp, '');
-      body += '<td'+on+'>'+txt+'</td>';
-    });
-    body += '</tr>';
-  });
-  return '<table class="mat">'+th+body+'</table>';
-}
-function bindTips(root){
-  if (!root) return;
-  root.querySelectorAll('.stcell').forEach(el => {
-    el.addEventListener('mouseenter', () => {
-      const tip = el.querySelector('.sttip');
-      if (!tip) return;
-      el.classList.remove('flip');
-      tip.style.display = 'block';
-      const wrap = el.closest('.matwrap');
-      const wr = wrap ? wrap.getBoundingClientRect() : {right: window.innerWidth};
-      const tr = tip.getBoundingClientRect();
-      if (tr.right > wr.right - 6) el.classList.add('flip');
-      tip.style.display = '';
-    });
-  });
-}
-function renderMat(){
-  const el = document.getElementById('daymat');
-  const el2 = document.getElementById('daymat2');
-  const k1 = ymdList(15, 0);
+function dcKeys(n){
+  const ks = ymdList(n, 0);
   const dv = devToday();
-  if (dv > k1[0]) k1.unshift(dv);           /* device already rolled to tomorrow's date */
-  if (el) el.innerHTML = matTable(k1);
-  if (el2) el2.innerHTML = matTable(ymdList(16, 15));
-  bindTips(el); bindTips(el2);
+  if (dv > ks[0]) ks.unshift(dv);
+  return ks.reverse();                 /* oldest → newest */
 }
-try { renderMat(); } catch (e) { console.log(e); }
+function dcLabel(k){ const t = devToday(); return k===t ? '오늘' : (k.slice(4,6)+'/'+k.slice(6,8)); }
+function dcFmt(v, dp){ return v==null ? '—' : Number(v).toFixed(dp); }
+function drawDay(cv, spec, keys, recs){
+  const dpr = window.devicePixelRatio||1, W = cv.clientWidth, H = cv.clientHeight;
+  if (!W || !H) return;
+  cv.width = W*dpr; cv.height = H*dpr;
+  const g = cv.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0);
+  g.clearRect(0,0,W,H);
+  const L=44, R=6, T=10, B=18, pw=W-L-R, ph=H-T-B, n=keys.length, sw=pw/n;
+  const today = devToday();
+  const vals = spec.series.map(s => recs.map(r => r.real ? dcNum(s.get(r.d)) : null));
+  let lo=Infinity, hi=-Infinity;
+  for (let i=0;i<n;i++){
+    if (spec.stacked){ let t=0, any=false; vals.forEach(v => { if (v[i]!=null){ t+=v[i]; any=true; } }); if (any){ lo=Math.min(lo,t); hi=Math.max(hi,t); } }
+    else vals.forEach(v => { if (v[i]!=null){ lo=Math.min(lo,v[i]); hi=Math.max(hi,v[i]); } });
+  }
+  g.strokeStyle='#2a3b4d'; g.lineWidth=1; g.strokeRect(L+.5,T+.5,pw,ph);
+  g.font='10px ui-monospace,Menlo,monospace'; g.fillStyle='#6d8296';
+  /* today (provisional) slot */
+  const ti = keys.indexOf(today);
+  if (ti >= 0){ g.fillStyle='#22323f'; g.fillRect(L+ti*sw, T+1, sw, ph-1); }
+  /* x labels */
+  const every = Math.max(1, Math.ceil(n/8));
+  g.textAlign='center';
+  for (let i=0;i<n;i++){
+    if ((n-1-i) % every) continue;
+    g.fillStyle = (i===ti) ? '#e8eef4' : '#6d8296';
+    g.fillText(dcLabel(keys[i]), L+(i+0.5)*sw, H-5);
+  }
+  cv._dc = {L, sw, n, keys, recs, spec, vals};
+  if (lo===Infinity){ g.fillStyle='#6d8296'; g.fillText('기록 없음', L+pw/2, T+ph/2); return; }
+  if (spec.zero) lo = Math.min(0, lo);
+  if (lo===hi){ hi += spec.zero ? 1 : 0.5; if (!spec.zero) lo -= 0.5; }
+  const pad = spec.zero ? (hi-lo)*0.06 : (hi-lo)*0.1;
+  const y0 = lo - (spec.zero ? 0 : pad), y1 = hi + pad;
+  const Y = v => T + (y1 - v)/(y1 - y0)*ph;
+  g.fillStyle='#6d8296'; g.textAlign='right';
+  g.fillText(dcFmt(hi, spec.dp), L-4, Y(hi)+3); g.fillText(dcFmt(lo, spec.dp), L-4, Math.min(T+ph, Y(lo)+3));
+  g.strokeStyle='#22323f'; g.beginPath(); g.moveTo(L, Y(hi)+.5); g.lineTo(L+pw, Y(hi)+.5); g.stroke();
+  const bars = spec.series.filter(s => s.type==='bar').length;
+  /* bars */
+  for (let i=0;i<n;i++){
+    const prov = (i===ti);
+    const x0 = L + i*sw + sw*0.14, bw = sw*0.72;
+    if (spec.stacked){
+      let acc = 0;
+      spec.series.forEach((s, si) => {
+        const v = vals[si][i]; if (v==null || v<=0) return;
+        const ya = Y(acc), yb = Y(acc+v); acc += v;
+        g.globalAlpha = prov ? 0.45 : 1; g.fillStyle = s.color; g.fillRect(x0, yb, bw, ya-yb);
+      });
+      g.globalAlpha = 1;
+      if (prov && acc>0){ g.setLineDash([3,2]); g.strokeStyle='#e8eef4'; g.strokeRect(x0+.5, Y(acc)+.5, bw-1, Y(0)-Y(acc)-1); g.setLineDash([]); }
+      continue;
+    }
+    let bi = 0;
+    spec.series.forEach((s, si) => {
+      if (s.type!=='bar') return;
+      const v = vals[si][i], w = bw/bars, x = x0 + bi*w; bi++;
+      if (v==null) return;
+      const yv = Y(Math.max(v,0)), yz = Y(0);
+      g.globalAlpha = prov ? 0.45 : 1; g.fillStyle = s.color;
+      g.fillRect(x, yv, Math.max(1, w-1), Math.max(1, yz-yv));
+      g.globalAlpha = 1;
+      if (prov){ g.setLineDash([3,2]); g.strokeStyle=s.color; g.strokeRect(x+.5, yv+.5, Math.max(1,w-2), Math.max(1,yz-yv-1)); g.setLineDash([]); }
+    });
+  }
+  /* band between two line series */
+  if (spec.band && vals.length >= 2){
+    g.fillStyle='rgba(0,179,164,0.13)';
+    for (let i=0;i<n-1;i++){
+      const a=vals[0][i], b=vals[1][i], c=vals[0][i+1], d=vals[1][i+1];
+      if ([a,b,c,d].some(v => v==null)) continue;
+      const xa=L+(i+0.5)*sw, xb=L+(i+1.5)*sw;
+      g.beginPath(); g.moveTo(xa,Y(a)); g.lineTo(xb,Y(c)); g.lineTo(xb,Y(d)); g.lineTo(xa,Y(b)); g.closePath(); g.fill();
+    }
+  }
+  /* lines: consecutive real days only (gap on a missing day) */
+  spec.series.forEach((s, si) => {
+    if (s.type!=='line') return;
+    const v = vals[si];
+    g.strokeStyle = s.color; g.lineWidth = 1.5;
+    for (let i=0;i<n-1;i++){
+      if (v[i]==null || v[i+1]==null) continue;
+      g.setLineDash(i+1===ti ? [3,2] : []);
+      g.beginPath(); g.moveTo(L+(i+0.5)*sw, Y(v[i])); g.lineTo(L+(i+1.5)*sw, Y(v[i+1])); g.stroke();
+    }
+    g.setLineDash([]);
+    for (let i=0;i<n;i++){
+      if (v[i]==null) continue;
+      g.beginPath(); g.arc(L+(i+0.5)*sw, Y(v[i]), 2.4, 0, 7);
+      if (i===ti){ g.fillStyle='#15202b'; g.fill(); g.strokeStyle=s.color; g.lineWidth=1.2; g.stroke(); }
+      else { g.fillStyle=s.color; g.fill(); }
+    }
+  });
+  /* error days */
+  g.fillStyle='#ff5d5d';
+  for (let i=0;i<n;i++){
+    if (!recs[i].real || !dcErr(recs[i].d)) continue;
+    const x = L+(i+0.5)*sw;
+    g.beginPath(); g.moveTo(x-4, T+1); g.lineTo(x+4, T+1); g.lineTo(x, T+7); g.closePath(); g.fill();
+  }
+}
+function dcHover(cv, e){
+  const c = cv._dc, out = document.getElementById('dh_'+cv.dataset.id);
+  if (!c || !out) return;
+  const i = Math.floor((e.offsetX - c.L)/c.sw);
+  if (i < 0 || i >= c.n){ out.textContent=''; return; }
+  const r = c.recs[i];
+  let t = dcLabel(c.keys[i]) + (c.keys[i]===devToday() ? '(진행)' : '');
+  if (!r.real){ out.textContent = t + ' 기록 없음'; return; }
+  let parts;
+  if (c.spec.stacked){
+    const tot = c.vals.reduce((a,v) => a + (v[i]||0), 0);
+    parts = c.spec.series.map((s, si) => { const v = c.vals[si][i];
+      return s.name + ' ' + fmtMin(v) + (tot>0 && v!=null ? ' ' + Math.round(100*v/tot) + '%' : ''); });
+    parts.push('계 ' + fmtMin(tot));
+  } else {
+    parts = c.spec.series.map((s, si) => s.name + ' ' + dcFmt(c.vals[si][i], c.spec.dp) + (c.vals[si][i]!=null ? (c.spec.unit||'') : ''));
+  }
+  const er = dcErr(r.d);
+  out.textContent = t + ' · ' + parts.join(' · ') + (er ? ' · ' : '');
+  if (er){ const e = document.createElement('span'); e.className = 'e'; e.textContent = '오류 ' + er; out.appendChild(e); }
+}
+function renderDayCharts(){
+  const grid = document.getElementById('dcgrid');
+  if (!grid) return;
+  /* 30-day toggle only if there is a real record older than 15 days */
+  const older = ymdList(16, 15).some(k => dcHasRec(recOf(k)));
+  const b30 = document.querySelector('#dchart button[data-n="30"]');
+  if (b30) b30.disabled = !older;
+  const n = (DC_N === 30 && older) ? 30 : 15;
+  document.querySelectorAll('#dchart button').forEach(b => b.classList.toggle('on', Number(b.dataset.n)===n));
+  if (!grid.dataset.built){
+    grid.dataset.built = '1';
+    grid.innerHTML = DC_SPECS.map(s => '<div class="dcard"><div class="dct"><span>' + s.title +
+      (s.series.length>1 ? '<span class="dclg">' + s.series.map(x => '<i style="background:'+x.color+'"></i>'+x.name).join('') + '</span>' : '') +
+      '</span></div><canvas id="dc_'+s.id+'" data-id="'+s.id+'"></canvas><div class="dch" id="dh_'+s.id+'"></div></div>').join('');
+    DC_SPECS.forEach(s => {
+      const cv = document.getElementById('dc_'+s.id);
+      cv.addEventListener('mousemove', e => dcHover(cv, e));
+      cv.addEventListener('mouseleave', () => { document.getElementById('dh_'+s.id).textContent=''; });
+    });
+  }
+  const keys = dcKeys(n);
+  const recs = keys.map(k => { const d = recOf(k); return {d, real: dcHasRec(d)}; });
+  DC_SPECS.forEach(s => drawDay(document.getElementById('dc_'+s.id), s, keys, recs));
+}
+document.querySelectorAll('#dchart button').forEach(b => b.addEventListener('click', () => {
+  if (b.disabled) return;
+  DC_N = Number(b.dataset.n); localStorage.setItem('dc_n', String(DC_N)); renderDayCharts();
+}));
+window.addEventListener('resize', () => { try { renderDayCharts(); } catch(e) {} });
+function renderDays(){ try { renderDayCharts(); } catch (e) { console.log(e); } }
+renderDays();
 
 async function getJson(url, ms){
   const ctl = new AbortController();
@@ -1538,7 +1894,7 @@ async function tick(){
     if (s.days) {
       DAYS = Object.keys(s.days).map(k => Object.assign({ymd:k}, s.days[k]));
     }
-    renderMat();
+    renderDays();
   } catch(e) {}
 }
 
@@ -1547,14 +1903,14 @@ async function loadDays(){
   if (s && s.days){
     if (s.dev_ymd) DEV = String(s.dev_ymd);
     DAYS = Object.keys(s.days).map(k => Object.assign({ymd:k}, s.days[k]));
-    renderMat();
+    renderDays();
   }
 }
-try { renderMat(); } catch (e) {}
-renderMat();
 loadDays();
 tick();
 setInterval(tick, 2000);
+loadSpark();
+setInterval(loadSpark, 30000);
 (function(){
   const q = new URLSearchParams(location.search);
   const only = q.get('only') || q.get('view') || '';
@@ -1567,10 +1923,8 @@ setInterval(tick, 2000);
     if (hd) hd.style.display='none';
     document.body.style.background='#15202b';
   } else if (only==='top'){
-    const m=document.getElementById('daymat');
-    const hint=document.querySelector('.hint');
-    if (m) m.style.display='none';
-    if (hint) hint.style.display='none';
+    const dc=document.getElementById('dchart');
+    if (dc) dc.style.display='none';
   }
 })();
 
@@ -1758,6 +2112,17 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/spark":
+            key = (parse_qs(urlparse(self.path).query).get("range") or ["1h"])[0]
+            if key not in SPARK_RANGES:
+                key = "1h"
+            body = json.dumps(_spark(key)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path == "/api/status_hist":
             key = (parse_qs(urlparse(self.path).query).get("range") or ["24h"])[0]
             if key not in STATUS_RANGES:
@@ -1889,6 +2254,7 @@ def main() -> None:
     print("influx", INFLUX_URL, "org", INFLUX_ORG, "bucket", INFLUX_BUCKET,
           "token", "ok" if tok else "MISSING")
     threading.Thread(target=mqtt_thread, daemon=True).start()
+    threading.Thread(target=_live_backfill, daemon=True).start()
     httpd = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), H)
     print(f"victron      http://127.0.0.1:{HTTP_PORT}")
     print(f"status graph http://127.0.0.1:{HTTP_PORT}/status")
