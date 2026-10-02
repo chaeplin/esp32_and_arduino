@@ -18,7 +18,7 @@ BLE 광고를 복호화해 MQTT JSON으로 올리고, GATT는 **일일 이력(�
 
 ADV / GATT 패킷 캡처와 Feather 시리얼 로그를 [슈퍼그록(SuperGrok)](https://grok.com) / Grokbot과 맞춰 가며 만들었습니다. 공식 Victron SDK가 아닙니다.
 
-[README](./victron-ble-mqtt/README.md) · [한국어](./victron-ble-mqtt/README.ko.md) · MIT
+[README](./victron-ble-mqtt/README.md) · MIT
 
 </td>
 </tr>
